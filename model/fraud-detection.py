@@ -18,6 +18,9 @@ import numpy as np
 import csv
 import logging
 import tensorflow as tf
+from tensorflow_privacy.privacy.optimizers.dp_optimizer_keras import DPKerasSGDOptimizer
+# Correct import for tensorflow-privacy==0.7.3
+from tensorflow_privacy.privacy.analysis.compute_dp_sgd_privacy_lib import compute_dp_sgd_privacy
 
 from swarmlearning.tf import SwarmCallback
 
@@ -45,6 +48,16 @@ def main():
   scratchDir = os.getenv('SCRATCH_DIR', '/platform/scratch')
   maxEpoch = int(os.getenv('MAX_EPOCHS', str(defaultMaxEpoch)))
   minPeers = int(os.getenv('MIN_PEERS', str(defaultMinPeers)))
+  dpEnabled = os.getenv('DP_ENABLED', 'false').lower() == 'true'
+  noiseMultiplier = float(
+    os.getenv('NOISE_MULTIPLIER', '0.0')
+  )
+  l2NormClip = float(
+    os.getenv('L2_NORM_CLIP', '1.0')
+  )
+  microbatches = int(
+    os.getenv('MICROBATCHES', str(batchSize))
+  )
   os.makedirs(scratchDir, exist_ok=True)
   print('***** Starting model =', modelName)
   # ================== load test and train Data =========================
@@ -55,7 +68,8 @@ def main():
   with open(trainFile, 'r') as f:
     # first line is the header row so remove it
     trainData = np.array(list(csv.reader(f, delimiter=","))[1:], dtype=float)
-    print('size of training Data set : %s' % np.size(trainData,0))
+    num_train_samples = np.size(trainData, 0)
+    print('size of training Data set : %s' % num_train_samples)
 
   print('-' * 64)
   testFile = dataDir + '/' + testFileName
@@ -71,9 +85,33 @@ def main():
   model = tf.keras.models.Sequential()
   model.add(tf.keras.layers.Dense(1, input_shape=(30,), activation='sigmoid',
     kernel_initializer='random_uniform', bias_initializer='zeros'))
-  sgd = tf.keras.optimizers.SGD(learning_rate=0.01, decay=1e-6, momentum=0.9, nesterov=True)
-  model.compile(loss = 'binary_crossentropy',
-                optimizer=sgd,
+  if dpEnabled:
+    print("***** Using DP-SGD optimizer")
+
+    optimizer = DPKerasSGDOptimizer(
+        l2_norm_clip=l2NormClip,
+        noise_multiplier=noiseMultiplier,
+        num_microbatches=microbatches,
+        learning_rate=0.01
+    )
+
+  else:
+    print("***** Using standard SGD optimizer")
+
+    optimizer = tf.keras.optimizers.SGD(
+        learning_rate=0.01,
+        decay=1e-6,
+        momentum=0.9,
+        nesterov=True
+    )
+    
+  loss = tf.keras.losses.BinaryCrossentropy(
+    from_logits=False,
+    reduction=tf.keras.losses.Reduction.NONE
+  )
+
+  model.compile(loss = loss,
+                optimizer=optimizer,
                 metrics=[tf.keras.metrics.AUC()])
   print(model.summary())
 
@@ -81,33 +119,56 @@ def main():
   x_train, y_train = getXY(trainData)
   x_test, y_test = getXY(testData)
 
-  # Adding swarm callback
+  # Professional Data Pipeline Fix for DP-SGD
+  train_ds = tf.data.Dataset.from_tensor_slices((x_train, y_train))
+  train_ds = train_ds.shuffle(len(x_train)).batch(batchSize, drop_remainder=True)
+  train_ds = train_ds.prefetch(tf.data.AUTOTUNE)
 
-  # In SwarmCallBack following parameter is provided to enable displaying training
-  # progress or ETA of training on the SLM UI.
-  # 'totalEpochs' - Total epochs used in local training.
+  val_ds = tf.data.Dataset.from_tensor_slices((x_test, y_test)).batch(batchSize)
+  val_ds = val_ds.prefetch(tf.data.AUTOTUNE)
+
+  # Adding swarm callback
   swarmCallback = SwarmCallback(syncFrequency=128,
                                 minPeers=minPeers,
-                                adsValData=(x_test, y_test),
+                                adsValData=val_ds,
                                 adsValBatchSize=batchSize,
                                 mergeMethod='mean',
                                 totalEpochs=maxEpoch)
 
   # Model training
   model.fit(
-      x_train
-    , y_train
-    , batch_size=batchSize
+      train_ds
     , epochs=maxEpoch
-    , validation_data=(x_test, y_test)
-    , shuffle=True
+    , validation_data=val_ds
     , callbacks=[swarmCallback]
   )
 
   print('Training done!')
 
+  # Calculate Epsilon and Delta if DP is enabled
+  if dpEnabled and noiseMultiplier > 0:
+      print('-' * 64)
+      print('***** PRIVACY REPORT *****')
+      # Calculate delta based on dataset size
+      delta = 1.0 / num_train_samples
+      
+      # compute_dp_sgd_privacy returns (epsilon, optimal_order)
+      eps, _ = compute_dp_sgd_privacy(
+          n=num_train_samples, 
+          batch_size=batchSize, 
+          noise_multiplier=noiseMultiplier, 
+          epochs=maxEpoch, 
+          delta=delta
+      )
+      print(f"Final Epsilon (ε): {eps:.2f}")
+      print(f"Final Delta (δ):   {delta:.2e}")
+      print('**************************')
+      print('-' * 64)
+  elif dpEnabled and noiseMultiplier <= 0:
+      print("***** WARNING: noise_multiplier is 0.0. Privacy budget is infinite.")
+
   # Evaluate
-  scores = model.evaluate(x_test, y_test, verbose=1)
+  scores = model.evaluate(val_ds, verbose=1)
   print('***** Test loss:', scores[0])
   print('***** Test auc:', scores[1])
 
