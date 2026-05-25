@@ -100,7 +100,7 @@ chmod -R 777 ~/swarm-learning/workspace/fashion-mnist/results
 
 ---
 
-# 5. Copy SwarmLearning Wheel + Remove Duplicate
+# 5. Copy SwarmLearning Wheel
 
 ```bash
 cp ~/swarm-learning/lib/swarmlearning-client-py3-none-manylinux_2_24_x86_64.whl \
