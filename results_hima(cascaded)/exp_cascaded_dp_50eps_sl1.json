@@ -1,0 +1,11 @@
+{
+  "config": {
+    "dp_enabled": true,
+    "epochs": 50,
+    "cascaded_dp": true
+  },
+  "privacy": {
+    "epsilon": 5.4473,
+    "dp_drop_epoch": 7
+  }
+}
