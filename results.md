@@ -163,6 +163,15 @@ No adaptive adjustments were triggered during training.
 | 19    | 0.8088              | 0.5640 → 0.5922 |
 | 20    | 0.8087              | 0.5922 → 0.6218 |
 
+## Cascaded DP
+
+| Method                     | Node | DP Enabled | Cascaded DP | Noise Multiplier | L2 Norm Clip | Microbatches | Learning Rate | Epochs | Epsilon (ε) | Delta (δ) | DP Drop Epoch | Loss   | Accuracy | F1 Score | Training Time (s) | Training Time (min) |
+|----------------------------|------|------------|-------------|------------------|--------------|--------------|---------------|--------|-------------|-----------|---------------|--------|----------|----------|-------------------|---------------------|
+| Cascaded DP       | 0    | Yes        | Yes         | 0.5              | 1.0          | 32           | 0.001         | 50     | 5.8038      | 3.33e-05  | 9             | 0.3170 | 0.8880   | 0.8878   | 948.06            | 15.80               |
+| Cascaded DP       | 1    | Yes        | Yes         | 0.5              | 1.0          | 32           | 0.001         | 50     | 5.6255      | 3.33e-05  | 8             | 0.3170 | 0.8880   | 0.8878   | 935.62            | 15.59               |
+| SNR-Gated Cascaded DP      | 0    | Yes        | Yes         | 0.5              | 1.0          | 32           | 0.001         | 50     | 10.2567     | 3.33e-05  | N/A           | 0.8688 | 0.8281   | 0.8250   | 1687.24           | 28.12               |
+| SNR-Gated Cascaded DP      | 1    | Yes        | Yes         | 0.5              | 1.0          | 32           | 0.001         | 50     | 10.2567     | 3.33e-05  | N/A           | 0.8688 | 0.8281   | 0.8250   | 1692.68           | 28.21               |
+
 ---
 
 ## Results (Sidharth)
