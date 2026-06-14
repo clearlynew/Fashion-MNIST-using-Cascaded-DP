@@ -78,19 +78,31 @@
 
 <img width="2385" height="875" alt="comparison_plot_extended" src="https://github.com/user-attachments/assets/ff57e973-7ae7-4211-ba03-8a361ac61e7d" />
 
-| Experiment               | ML Node      | DP  | Cascaded DP | Noise | Epochs | Training Time (s) | Test Loss | Test Accuracy (%) | Macro F1 (%) | ε (Epsilon) | δ (Delta) | DP Drop Epoch | Gradient Stability Threshold | Accuracy Plateau Threshold |
-| ------------------------ | ------------ | --- | ----------- | ----- | ------ | ----------------: | --------: | ----------------: | -----------: | ----------: | --------- | ------------: | ---------------------------: | -------------------------: |
-| Label Skew Baseline      | ML1 (Node 0) | No  | No          | 0.0   | 50     |            753.27 |    0.3223 |             88.55 |        88.51 |         N/A | N/A       |           N/A |                          N/A |                        N/A |
-| Label Skew Baseline      | ML2 (Node 1) | No  | No          | 0.0   | 50     |            754.04 |    0.3223 |             88.55 |        88.51 |         N/A | N/A       |           N/A |                          N/A |                        N/A |
-| Label Skew + Standard DP | ML1 (Node 0) | Yes | No          | 0.5   | 50     |           1383.93 |    0.8686 |             82.64 |        82.60 |     10.2567 | 3.33×10⁻⁵ |           N/A |                          N/A |                        N/A |
-| Label Skew + Standard DP | ML2 (Node 1) | Yes | No          | 0.5   | 50     |           1380.00 |    0.8686 |             82.64 |        82.60 |     10.2567 | 3.33×10⁻⁵ |           N/A |                          N/A |                        N/A |
-| Label Skew + Cascaded DP | ML1 (Node 0) | Yes | Yes         | 0.5   | 50     |            961.81 |    0.3266 |             88.15 |        88.14 |      7.0512 | 3.33×10⁻⁵ |            16 |                         0.01 |                     0.0005 |
-| Label Skew + Cascaded DP | ML2 (Node 1) | Yes | Yes         | 0.5   | 50     |            958.32 |    0.3266 |             88.15 |        88.14 |      7.0512 | 3.33×10⁻⁵ |            16 |                         0.01 |                     0.0005 |
+| Experiment                       | ML Node      | DP  | Cascaded DP | Noise | Epochs | Training Time (s) | Test Loss | Test Accuracy (%) | Macro F1 (%) | ε (Epsilon) | δ (Delta) | DP Drop Epoch | Gradient Stability Threshold | Accuracy Plateau Threshold |
+| -------------------------------- | ------------ | --- | ----------- | ----- | ------ | ----------------: | --------: | ----------------: | -----------: | ----------: | --------- | ------------: | ---------------------------: | -------------------------: |
+| Label Skew Baseline              | ML1 (Node 0) | No  | No          | 0.0   | 50     |            753.27 |    0.3223 |             88.55 |        88.51 |         N/A | N/A       |           N/A |                          N/A |                        N/A |
+| Label Skew Baseline              | ML2 (Node 1) | No  | No          | 0.0   | 50     |            754.04 |    0.3223 |             88.55 |        88.51 |         N/A | N/A       |           N/A |                          N/A |                        N/A |
+| Label Skew + Standard DP         | ML1 (Node 0) | Yes | No          | 0.5   | 50     |           1383.93 |    0.8686 |             82.64 |        82.60 |     10.2567 | 3.33×10⁻⁵ |           N/A |                          N/A |                        N/A |
+| Label Skew + Standard DP         | ML2 (Node 1) | Yes | No          | 0.5   | 50     |           1380.00 |    0.8686 |             82.64 |        82.60 |     10.2567 | 3.33×10⁻⁵ |           N/A |                          N/A |                        N/A |
+| Label Skew + Cascaded DP         | ML1 (Node 0) | Yes | Yes         | 0.5   | 50     |            961.81 |    0.3266 |             88.15 |        88.14 |      7.0512 | 3.33×10⁻⁵ |            16 |                         0.01 |                     0.0005 |
+| Label Skew + Cascaded DP         | ML2 (Node 1) | Yes | Yes         | 0.5   | 50     |            958.32 |    0.3266 |             88.15 |        88.14 |      7.0512 | 3.33×10⁻⁵ |            16 |                         0.01 |                     0.0005 |
+| Extreme Label Skew Baseline      | ML1 (Node 0) | No  | No          | 0.0   | 50     |            747.11 |    0.5765 |             78.10 |        79.18 |         N/A | N/A       |           N/A |                          N/A |                        N/A |
+| Extreme Label Skew Baseline      | ML2 (Node 1) | No  | No          | 0.0   | 50     |            743.52 |    0.5765 |             78.10 |        79.18 |         N/A | N/A       |           N/A |                          N/A |                        N/A |
+| Extreme Label Skew + Standard DP | ML1 (Node 0) | Yes | No          | 0.5   | 50     |           1407.24 |    1.0890 |             76.42 |        77.07 |     10.2567 | 3.33×10⁻⁵ |           N/A |                          N/A |                        N/A |
+| Extreme Label Skew + Standard DP | ML2 (Node 1) | Yes | No          | 0.5   | 50     |           1406.02 |    1.0890 |             76.42 |        77.07 |     10.2567 | 3.33×10⁻⁵ |           N/A |                          N/A |                        N/A |
+| Extreme Label Skew + Cascaded DP | ML1 (Node 0) | Yes | Yes         | 0.5   | 50     |           1019.55 |    0.6876 |             74.11 |        75.28 |      7.4632 | 3.33×10⁻⁵ |            19 |                         0.01 |                     0.0005 |
+| Extreme Label Skew + Cascaded DP | ML2 (Node 1) | Yes | Yes         | 0.5   | 50     |           1019.32 |    0.6876 |             74.11 |        75.28 |      7.5533 | 3.33×10⁻⁵ |            20 |                         0.01 |                     0.0005 |
 
 | Node         | DP Drop Epoch | Val Acc (t-4) | Val Acc (t-3) | Val Acc (t-2) | Val Acc (t-1) | Val Acc (t) | Rolling Mean |
 | ------------ | ------------: | ------------: | ------------: | ------------: | ------------: | ----------: | -----------: |
 | ML1 (Node 0) |            16 |        76.89% |        77.25% |        77.39% |        77.65% |      78.08% |       6.4467 |
 | ML2 (Node 1) |            16 |        69.34% |        69.95% |        72.32% |        73.34% |      73.88% |      10.1055 |
+
+| Node         | DP Drop Epoch | Val Acc (t-4) | Val Acc (t-3) | Val Acc (t-2) | Val Acc (t-1) | Val Acc (t) | Rolling Mean |
+| ------------ | ------------: | ------------: | ------------: | ------------: | ------------: | ----------: | -----------: |
+| ML1 (Node 0) |            19 |        70.62% |        71.76% |        70.85% |        70.05% |      72.72% |      10.1318 |
+| ML2 (Node 1) |            20 |        54.55% |        54.22% |        54.75% |        55.76% |      56.26% |      23.8160 |
+
 
 | Experiment            | ML Node      | Samples | Weight | DP  | Cascaded DP | Noise | Epochs | Training Time (s) | Test Loss | Test Accuracy (%) | Macro F1 (%) | ε (Epsilon) | δ (Delta) | DP Drop Epoch | Gradient Stability Threshold | Accuracy Plateau Threshold |
 | --------------------- | ------------ | ------: | -----: | --- | ----------- | ----- | ------ | ----------------: | --------: | ----------------: | -----------: | ----------: | --------- | ------------: | ---------------------------: | -------------------------: |
