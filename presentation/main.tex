@@ -1,1 +1,117 @@
+\documentclass[10pt,aspectratio=169]{beamer}
+\usetheme{Madrid}
+\usecolortheme{whale}
 
+% --- Packages ---
+\usepackage{amsmath,amsfonts,amssymb}
+\usepackage{booktabs}
+\usepackage{tikz}
+\usetikzlibrary{shapes.geometric, arrows.meta, positioning}
+
+% --- Custom Configurations ---
+\setbeamertemplate{navigation symbols}{} % Remove navigation icons
+
+
+\begin{document}
+
+% --- Slide 1: The Swarm Privacy Paradox ---
+\begin{frame}{The Privacy Paradox in Swarm Learning}
+    \begin{center}
+        \large{\textbf{``Decentralization $\neq$ Absolute Privacy''}}
+    \end{center}
+    \vspace{0.3cm}
+
+    While Swarm Learning eliminates the single point of failure (central server) and keeps raw data $D_i$ localized at edge nodes, it introduces a severe vector of indirect vulnerability.
+
+    \begin{block}{The Underlying Mechanism of Leakage}
+        During P2P consensus stages, nodes broadcast intermediate model parameters $\theta_i$ or gradient updates $\nabla L(\theta_i)$. These weights contain high-dimensional mathematical footprints of the underlying local private distributions.
+    \end{block}
+
+    \begin{alertblock}{The Problem}
+        An adversary monitoring the blockchain state channels or interacting as an honest-but-curious peer can reverse-engineer private local data directly from public model parameters.
+    \end{alertblock}
+\end{frame}
+
+% --- Slide 2: Adversarial Threat Model & Attacks ---
+\begin{frame}{The Threat Model: Attack Vectors on Swarm Nodes}
+    We assume an ecosystem where malicious or compromised nodes have access to shared peer parameters $\theta$ over the peer-to-peer network layer.
+
+    \vspace{0.3cm}
+    \begin{table}[]
+        \centering
+        \small
+        \begin{tabular}{p{3.5cm} p{4.5cm} p{4.5cm}}
+            \toprule
+            \textbf{Attack Type} & \textbf{Mechanism} & \textbf{Impact on Swarm Node} \\
+            \midrule
+            \textbf{Gradient Inversion} & Reconstructing inputs $x$ from public gradients $\nabla L(\theta_i)$. & Complete exposure of training images/clinical records. \\
+            \addlinespace
+            \textbf{Membership Inference (MIA)} & Determining if target record $x \in D_i$ based on model confidence spikes. & Breach of individual data presence confidentiality. \\
+            \addlinespace
+            \textbf{Generative Adversarial Leakage (GAN)} & Malicious peer acts as a generator, utilizing shared $\theta$ as a discriminator. & Reconstruction of high-fidelity synthetic client datasets. \\
+            \bottomrule
+        \end{tabular}
+    \end{table}
+\end{frame}
+
+% --- Slide 3: Practical Barriers of Standard DP ---
+\begin{frame}{The Double Bottleneck of Standard Differential Privacy}
+    While Differential Privacy (DP) mathematically thwarts parameter reverse-engineering, applying standard DP algorithms over a standard federated training loop presents major bottlenecks:
+
+    \begin{columns}[T]
+        \begin{column}{0.48\textwidth}
+            \begin{alertblock}{1. Permanent Metric Degradation}
+                \begin{itemize}
+                    \item Model accuracy and overall quality drop severely compared to non-DP baselines.
+                    \item \textbf{No Epoch Cure:} This accuracy gap is structural; it \textbf{cannot} be resolved by simply running more training epochs due to cumulative noise effects.
+                \end{itemize}
+            \end{alertblock}
+        \end{column}
+        
+        \begin{column}{0.48\textwidth}
+            \begin{alertblock}{2. Computation \& Latency Penalty}
+                \begin{itemize}
+                    \item Total training time increases by at least \textbf{2X or more}.
+                    \item Exact execution latency depends highly on the chosen framework, batch configurations, and DP-specific optimization arguments.
+                \end{itemize}
+            \end{alertblock}
+        \end{column}
+    \end{columns}
+
+    \vspace{0.3cm}
+    \begin{center}
+        \textit{We face a zero-sum trade-off: stronger mathematical privacy inherently destroys utility and runtime efficiency.}
+    \end{center}
+\end{frame}
+
+% --- Slide 4: The Proposed Cascaded Swarm Learning Solution ---
+\begin{frame}{Proposed Solution: Cascaded P2P Swarm Ensemble}
+    To break this trade-off, a \textbf{Cascaded Ensemble of Swarm Learning} is executed in two distinct, sequential phases:
+
+    \vspace{0.3cm}
+    \begin{columns}[T]
+        \begin{column}{0.48\textwidth}
+            \begin{block}{Round 1: The Secure Anchor (With DP)}
+                \begin{itemize}
+                    \item \textbf{Execution:} Swarm Learning with active DP.
+                    \item \textbf{Setup:} Run on a minimal, highly curated subset of data for a small number of epochs.
+                    \item \textbf{Outcome:} Establishes a robust, structurally generic initial model without exhausting the privacy budget.
+                \end{itemize}
+            \end{block}
+        \end{column}
+
+        \begin{column}{0.48\textwidth}
+            \begin{block}{Round 2: The Utility Refiner (Without DP)}
+                \begin{itemize}
+                    \item \textbf{Execution:} Standard Swarm Learning (Non-DP).
+                    \item \textbf{Setup:} Run on the full dataset with a higher number of training epochs.
+                    \item \textbf{Outcome:} Uses the Round 1 model as a secure, pre-trained starting point to recover validation accuracy.
+                \end{itemize}
+            \end{block}
+        \end{column}
+    \end{columns}
+\end{frame}
+
+
+
+\end{document}
