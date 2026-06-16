@@ -1,4 +1,5 @@
 import os
+import glob
 import json
 import time
 import pickle
@@ -23,12 +24,73 @@ defaultMinPeers = 2
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# EPOCH SYNCHRONIZATION BARRIER (for noniid_unequal)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class EpochBarrierCallback(tf.keras.callbacks.Callback):
+    """
+    Lightweight epoch-level barrier: each node writes a heartbeat file
+    at the END of every epoch, then busy-waits until ALL peers have
+    written that same epoch's heartbeat before proceeding.
+
+    This keeps the fast (small-data) node in lockstep with the slow
+    (large-data) node so the CascadedDP quorum window is always
+    evaluated at the same logical training epoch across the cluster.
+    """
+
+    def __init__(self, node_id, num_nodes, scratch_dir,
+                 poll_interval=2.0, timeout=7200.0):
+        super().__init__()
+        self.node_id       = node_id
+        self.num_nodes     = num_nodes
+        self.scratch_dir   = scratch_dir
+        self.poll_interval = poll_interval   # seconds between fs polls
+        self.timeout       = timeout         # max wait per epoch (safety valve)
+
+        # Clean up stale heartbeats from previous runs
+        for f in glob.glob(os.path.join(scratch_dir, ".epoch_barrier_*")):
+            try:
+                os.remove(f)
+            except Exception:
+                pass
+
+    def _heartbeat_path(self, peer_id, epoch):
+        return os.path.join(
+            self.scratch_dir,
+            f".epoch_barrier_node_{peer_id}_epoch_{epoch}"
+        )
+
+    def on_epoch_end(self, epoch, logs=None):
+        # 1. Announce this node has finished epoch `epoch`
+        hb = self._heartbeat_path(self.node_id, epoch)
+        with open(hb, 'w') as f:
+            f.write(f"node={self.node_id} epoch={epoch} done")
+
+        print(f"  [EpochBarrier] Node {self.node_id} waiting at epoch {epoch + 1} ...")
+
+        # 2. Busy-wait until every peer has written its heartbeat
+        deadline = time.time() + self.timeout
+        while time.time() < deadline:
+            votes = sum(
+                1 for pid in range(self.num_nodes)
+                if os.path.exists(self._heartbeat_path(pid, epoch))
+            )
+            if votes == self.num_nodes:
+                print(f"  [EpochBarrier] All {self.num_nodes} nodes at epoch {epoch + 1} — proceeding.")
+                return
+            time.sleep(self.poll_interval)
+
+        # Timeout is non-fatal; log and continue so training isn't permanently stalled
+        print(f"  [EpochBarrier] WARNING: timeout waiting for peers at epoch {epoch + 1}. Proceeding anyway.")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # DECENTRALIZED CASCADED DP CALLBACK (SWARM CONSENSUS)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class CascadedDPCallback(tf.keras.callbacks.Callback):
     """
-    Drops differential privacy across ALL swarm nodes simultaneously using a 
+    Drops differential privacy across ALL swarm nodes simultaneously using a
     fully decentralized Quorum-based Peer Consensus mechanism.
     """
 
@@ -61,19 +123,19 @@ class CascadedDPCallback(tf.keras.callbacks.Callback):
         # Tracking windows
         self.grad_norm_window = deque(maxlen=window_size)
         self.acc_window        = deque(maxlen=window_size)
-        
+
         # Telemetry history tracking
         self.grad_history     = []
         self.rolling_history  = []
         self.acc_history      = []
-        
+
         self.dp_active        = True
-        self.dp_drop_epoch    = None   
+        self.dp_drop_epoch    = None
         self.dp_drop_reason   = None
 
         # Consensus directory setup
         self.vote_file = os.path.join(self.scratch_dir, f".vote_drop_dp_node_{self.node_id}")
-        
+
         # Clean up old votes from previous experimental runs at bootup
         if os.path.exists(self.vote_file):
             try:
@@ -88,7 +150,7 @@ class CascadedDPCallback(tf.keras.callbacks.Callback):
         norms = []
         for x, y in self.val_ds.take(5):
             with tf.GradientTape() as tape:
-                preds    = self.model(x, training=True)   
+                preds    = self.model(x, training=True)
                 loss_val = self._measure_loss(y, preds)
 
             grads     = tape.gradient(loss_val, self.model.trainable_variables)
@@ -121,7 +183,7 @@ class CascadedDPCallback(tf.keras.callbacks.Callback):
             self.model.train_function = None
             self.model.test_function = None
             self.model.predict_function = None
-            
+
             # Run immediate graph tracing session to bypass NoneType crash
             for x_sample, y_sample in self.val_ds.take(1):
                 self.model.make_train_function()
@@ -129,7 +191,7 @@ class CascadedDPCallback(tf.keras.callbacks.Callback):
                 self.model.make_predict_function()
 
         self.dp_active     = False
-        self.dp_drop_epoch = epoch + 1   
+        self.dp_drop_epoch = epoch + 1
 
         self.dp_drop_reason = {
             "epoch": epoch + 1,
@@ -144,7 +206,7 @@ class CascadedDPCallback(tf.keras.callbacks.Callback):
 
     def on_epoch_end(self, epoch, logs=None):
         if not self.dp_active:
-            return   
+            return
 
         logs = logs or {}
         val_acc = logs.get('val_accuracy')
@@ -263,20 +325,20 @@ def main():
     modelName = 'fashion-mnist'
 
     # Read env vars
-    scratchDir = os.getenv('SCRATCH_DIR', '/platform/scratch')
-    maxEpoch = int(os.getenv('MAX_EPOCHS', str(defaultMaxEpoch)))
-    minPeers = int(os.getenv('MIN_PEERS', str(defaultMinPeers)))
-    dpEnabled = os.getenv('DP_ENABLED', 'false').lower() == 'true'
+    scratchDir      = os.getenv('SCRATCH_DIR', '/platform/scratch')
+    maxEpoch        = int(os.getenv('MAX_EPOCHS', str(defaultMaxEpoch)))
+    minPeers        = int(os.getenv('MIN_PEERS', str(defaultMinPeers)))
+    dpEnabled       = os.getenv('DP_ENABLED', 'false').lower() == 'true'
     noiseMultiplier = float(os.getenv('NOISE_MULTIPLIER', '0.0'))
-    l2NormClip = float(os.getenv('L2_NORM_CLIP', '1.0'))
-    microbatches = int(os.getenv('MICROBATCHES', str(batchSize)))
+    l2NormClip      = float(os.getenv('L2_NORM_CLIP', '1.0'))
+    microbatches    = int(os.getenv('MICROBATCHES', str(batchSize)))
 
     if batchSize % microbatches != 0:
         raise ValueError(f"MICROBATCHES ({microbatches}) must perfectly divide batchSize ({batchSize}).")
 
     optimizerType = os.getenv('OPTIMIZER', 'sgd').lower()
-    learningRate = float(os.getenv('LEARNING_RATE', '0'))
-    actual_lr = learningRate or (0.001 if optimizerType == 'adam' else 0.01)
+    learningRate  = float(os.getenv('LEARNING_RATE', '0'))
+    actual_lr     = learningRate or (0.001 if optimizerType == 'adam' else 0.01)
 
     # CascadedDP env vars
     cascadedDp    = os.getenv('CASCADED_DP', 'false').lower() == 'true'
@@ -297,16 +359,11 @@ def main():
     # LOAD DATA
     (x_train, y_train), (x_test, y_test) = tf.keras.datasets.fashion_mnist.load_data()
 
-    # ── PARTITION PER NODE ────────────────────────────────────────────────────
+  
+# ── PARTITION PER NODE ────────────────────────────────────────────────────
     rng = np.random.default_rng(seed=42)
 
     if partitionMode == 'noniid_equal':
-        # Label skew, equal size (30 000 / node).
-        # Single shuffle per class — node 0 and node 1 take complementary slices
-        # so Node0 ∩ Node1 = ∅ by construction.
-        #
-        # Classes 0-4:  Node 0 → first 80%,  Node 1 → last 20%
-        # Classes 5-9:  Node 0 → last  20%,  Node 1 → first 80%
         node_idx = []
         for c in range(10):
             idx   = np.where(y_train == c)[0]
@@ -322,10 +379,6 @@ def main():
         y_train = y_train[node_idx]
 
     elif partitionMode == 'noniid_unequal':
-        # Size imbalance, no label skew (IID label distribution).
-        # Node 0 → first 80% of every class (48 000 total)
-        # Node 1 → last  20% of every class (12 000 total)
-        # Single shuffle per class — complementary slices, zero overlap.
         node_idx = []
         for c in range(10):
             idx   = np.where(y_train == c)[0]
@@ -338,14 +391,52 @@ def main():
         y_train = y_train[node_idx]
 
     else:
-        # IID: contiguous split (original behaviour)
-        total_samples = len(x_train)
-        split_size    = total_samples // numNodes
-        start         = nodeId * split_size
-        end           = total_samples if nodeId == numNodes - 1 else start + split_size
-        x_train       = x_train[start:end]
-        y_train       = y_train[start:end]
+        # ── Dirichlet IID partition ──────────────────────────────────────────
+        # DIRICHLET_ALPHA controls heterogeneity:
+        #   'inf' or unset → true IID (global shuffle, equal split)
+        #   1.0            → mild heterogeneity
+        #   0.5            → moderate heterogeneity
+        #   0.1            → strong heterogeneity (near non-IID)
+        alpha_env = os.getenv('DIRICHLET_ALPHA', 'inf').lower()
 
+        if alpha_env == 'inf':
+            # True IID: global shuffle + contiguous equal split
+            perm    = rng.permutation(len(x_train))
+            x_train = x_train[perm]
+            y_train = y_train[perm]
+
+            split_size = len(x_train) // numNodes
+            start      = nodeId * split_size
+            end        = len(x_train) if nodeId == numNodes - 1 else start + split_size
+            x_train    = x_train[start:end]
+            y_train    = y_train[start:end]
+
+            print(f'***** partition_mode=iid (true IID, alpha=inf) | node={nodeId}')
+
+        else:
+            alpha = float(alpha_env)
+
+            node_idx = [[] for _ in range(numNodes)]
+            for c in range(10):
+                idx = np.where(y_train == c)[0]
+                rng.shuffle(idx)
+
+                proportions = rng.dirichlet(alpha=np.full(numNodes, alpha))
+                splits      = (proportions * len(idx)).astype(int)
+                splits[-1]  = len(idx) - splits[:-1].sum()   # fix rounding
+
+                boundaries = np.concatenate([[0], np.cumsum(splits)])
+                for n in range(numNodes):
+                    node_idx[n].extend(idx[boundaries[n]:boundaries[n + 1]])
+
+            # Trim to equal size across nodes
+            min_size  = min(len(ix) for ix in node_idx)
+            final_idx = np.array(node_idx[nodeId][:min_size])
+            rng.shuffle(final_idx)
+            x_train = x_train[final_idx]
+            y_train = y_train[final_idx]
+
+            print(f'***** partition_mode=iid (Dirichlet alpha={alpha}) | node={nodeId}')
     # NORMALIZE PIXELS
     x_train = x_train / 255.0
     x_test  = x_test / 255.0
@@ -359,7 +450,7 @@ def main():
 
     # ONE HOT ENCODE LABELS
     y_train = tf.keras.utils.to_categorical(y_train, 10)
-    y_test = tf.keras.utils.to_categorical(y_test, 10)
+    y_test  = tf.keras.utils.to_categorical(y_test, 10)
 
     # MODEL
     model = tf.keras.models.Sequential([
@@ -373,7 +464,11 @@ def main():
     ])
 
     optimizer = get_optimizer(optimizerType, dpEnabled, learningRate or None, l2NormClip, noiseMultiplier, microbatches)
-    loss = tf.keras.losses.CategoricalCrossentropy(from_logits=False, reduction=tf.keras.losses.Reduction.NONE) if dpEnabled else tf.keras.losses.CategoricalCrossentropy(from_logits=False)
+    loss = (
+        tf.keras.losses.CategoricalCrossentropy(from_logits=False, reduction=tf.keras.losses.Reduction.NONE)
+        if dpEnabled
+        else tf.keras.losses.CategoricalCrossentropy(from_logits=False)
+    )
 
     metrics = get_metrics()
     model.compile(loss=loss, optimizer=optimizer, metrics=metrics)
@@ -381,15 +476,19 @@ def main():
     # DATA PIPELINES
     train_ds = tf.data.Dataset.from_tensor_slices((x_train, y_train))
     train_ds = train_ds.shuffle(num_train_samples).batch(batchSize, drop_remainder=True).prefetch(tf.data.AUTOTUNE)
-    val_ds = tf.data.Dataset.from_tensor_slices((x_test, y_test)).batch(batchSize).prefetch(tf.data.AUTOTUNE)
+    val_ds   = tf.data.Dataset.from_tensor_slices((x_test, y_test)).batch(batchSize).prefetch(tf.data.AUTOTUNE)
+
     if partitionMode == "noniid_unequal":
-    	nodeWeightage = 80 if nodeId == 0 else 20
+        nodeWeightage = 80 if nodeId == 0 else 20
     else:
-    	nodeWeightage = 50
+        nodeWeightage = 50
+        
+    largest_node_samples = int(60000 * 0.8)  # 48000
+    steps_per_epoch = int(np.ceil(largest_node_samples / batchSize))  # 1500    
 
     # SWARM CALLBACK
     swarmCallback = SwarmCallback(
-        syncFrequency=1024,
+        syncFrequency=steps_per_epoch+1,
         minPeers=minPeers,
         adsValData=val_ds,
         adsValBatchSize=batchSize,
@@ -399,8 +498,19 @@ def main():
     )
 
     callbacks = [swarmCallback]
-    cascadedDpCallback = None
 
+    # ── Epoch barrier: keeps fast node locked to slow node's pace ──────────
+    # Must be appended BEFORE CascadedDPCallback so the barrier fires first,
+    # ensuring both nodes evaluate the same epoch's gradient stats together.
+    if partitionMode == 'noniid_unequal':
+        barrierCallback = EpochBarrierCallback(
+            node_id=nodeId,
+            num_nodes=numNodes,
+            scratch_dir=scratchDir,
+        )
+        callbacks.append(barrierCallback)
+
+    cascadedDpCallback = None
     if dpEnabled and cascadedDp:
         cascadedDpCallback = CascadedDPCallback(
             val_ds=val_ds,
@@ -444,14 +554,14 @@ def main():
         except Exception as e:
             print(f'***** Drift snapshot: could not compute ({e})')
 
-    # ─────────────────────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────────
     # COMPREHENSIVE FINAL TEST EVALUATION
-    # ─────────────────────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────────
     print('\nRunning final post-training evaluation on test dataset...')
-    
+
     # 1. Extract exact test loss and test accuracy using direct evaluate sweep
     eval_results = model.evaluate(val_ds, verbose=0)
-    final_test_loss = float(eval_results[0])
+    final_test_loss     = float(eval_results[0])
     final_test_accuracy = float(eval_results[1])
 
     # 2. Extract final global validation/test F1-Score
@@ -461,7 +571,7 @@ def main():
         preds = model.predict_on_batch(x_b)
         y_true_list.append(np.argmax(y_b.numpy(), axis=1))
         y_pred_list.append(np.argmax(preds, axis=1))
-    
+
     y_true = np.concatenate(y_true_list, axis=0)
     y_pred = np.concatenate(y_pred_list, axis=0)
     final_test_f1 = float(f1_score(y_true, y_pred, average='macro'))
@@ -471,9 +581,9 @@ def main():
     if dpEnabled and noiseMultiplier > 0:
         print('-' * 64)
         print('***** PRIVACY REPORT *****')
-        delta = 1.0 / num_train_samples
+        delta     = 1.0 / num_train_samples
         dp_epochs = cascadedDpCallback.dp_drop_epoch if (cascadedDpCallback and cascadedDpCallback.dp_drop_epoch) else maxEpoch
-        
+
         eps, _ = compute_dp_sgd_privacy(
             n=num_train_samples, batch_size=batchSize, noise_multiplier=noiseMultiplier, epochs=dp_epochs, delta=delta
         )
@@ -509,8 +619,7 @@ def main():
             "delta": 1.0 / num_train_samples if dpEnabled else None,
             "dp_drop_epoch": cascadedDpCallback.dp_drop_epoch if cascadedDpCallback else None,
             "dp_slope_threshold": slopeThresh,
-    	    "accuracy_plateau_threshold": accPlatThresh,
-
+            "accuracy_plateau_threshold": accPlatThresh,
             "dp_drop_reason": (
                 cascadedDpCallback.dp_drop_reason
                 if cascadedDpCallback
@@ -519,11 +628,11 @@ def main():
         }
     }
 
-    result_file = os.getenv("RESULT_FILE", "results.json")
+    result_file  = os.getenv("RESULT_FILE", "results.json")
     results_path = os.path.join("/results", result_file)
-    
+
     os.makedirs(os.path.dirname(results_path), exist_ok=True)
-    
+
     with open(results_path, 'w') as f:
         json.dump(results, f, indent=2)
 
