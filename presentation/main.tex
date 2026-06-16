@@ -1,19 +1,12 @@
-\documentclass[10pt,aspectratio=169]{beamer}
+\documentclass[aspectratio=169]{beamer}
+\usepackage{amsmath,booktabs,graphicx}
 \usetheme{Madrid}
-\usecolortheme{whale}
 
-% --- Packages ---
-\usepackage{amsmath,amsfonts,amssymb}
-\usepackage{booktabs}
-\usepackage{tikz}
-\usetikzlibrary{shapes.geometric, arrows.meta, positioning}
-
-% --- Custom Configurations ---
 \setbeamertemplate{navigation symbols}{} % Remove navigation icons
-
 
 \begin{document}
 
+% --- Sidharth --- %
 % --- Slide 1: The Swarm Privacy Paradox ---
 \begin{frame}{The Privacy Paradox in Swarm Learning}
     \begin{center}
@@ -113,5 +106,145 @@
 \end{frame}
 
 
+% --- Allen --- %
+%--------------------------------------------------
+% Slide 1: Motivation & Concept
+%--------------------------------------------------
+\begin{frame}{Cascaded Differential Privacy: The Big Idea}
+\begin{alertblock}{The Problem with Full‑DP}
+Applying DP throughout \emph{all} training epochs:
+\begin{itemize}
+    \item Degrades model accuracy (noise accumulation).
+    \item Slows training (2×–10× overhead from clipping/noise).
+    \item Exhausts the privacy budget $\varepsilon$ with diminishing returns.
+\end{itemize}
+\end{alertblock}
+
+\pause
+\begin{exampleblock}{Cascaded DP Solution}
+\begin{itemize}
+    \item \textbf{Phase 1}: Train with DP-Adam (strong privacy) \emph{only until convergence}.
+    \item \textbf{Phase 2}: Disable DP, switch to standard optimizer (Adam) to recover accuracy.
+    \item Decentralised swarm‑wide vote determines the transition point.
+\end{itemize}
+\end{exampleblock}
+\end{frame}
+
+%--------------------------------------------------
+% Slide 2: Two Phases Illustrated
+%--------------------------------------------------
+\begin{frame}{Two Distinct Training Phases}
+\begin{columns}[T]
+\column{0.48\textwidth}
+\begin{block}{Phase 1: Privacy‑Preserving}
+\begin{itemize}
+    \item DP-Adam (noisy, clipped gradients).
+    \item Convergence monitoring: gradient norm + validation accuracy.
+    \item Swarm nodes vote when their local model stabilises.
+    \item DP \textbf{ON} – protects against gradient leakage.
+\end{itemize}
+\end{block}
+
+\column{0.48\textwidth}
+\begin{block}{Phase 2: Performance Recovery}
+\begin{itemize}
+    \item Standard Adam (no DP noise).
+    \item Full gradient information for fine‑tuning.
+    \item No further $\varepsilon$ consumption.
+    \item Model accuracy rebounds toward non‑private baseline.
+\end{itemize}
+\end{block}
+\end{columns}
+
+\vspace{0.4cm}
+\centering
+\end{frame}
+
+%--------------------------------------------------
+% Slide 3: Convergence Criteria (How to Decide “When”)
+%--------------------------------------------------
+\begin{frame}{How a Node Decides It’s Time to Drop DP}
+Each node monitors two metrics over a rolling window ($W=5$ epochs):
+
+\vspace{0.3cm}
+\begin{columns}[t]
+\column{0.5\textwidth}
+\textbf{Gradient Norm Stabilisation}
+\[
+\left|\frac{\text{norm}_t - \overline{\text{norm}}_{\text{roll}}}
+           {\overline{\text{norm}}_{\text{roll}}}\right| 
+           < \theta_g \quad (\text{e.g. } 2\%)
+\]
+
+\column{0.5\textwidth}
+\textbf{Validation Accuracy Plateau}
+\[
+\mathrm{Var}(\text{acc}_{\text{roll}}) 
+    < \theta_a \quad (\text{e.g. } 0.5\%)
+\]
+\end{columns}
+
+\vspace{0.4cm}
+\begin{itemize}
+    \item Both conditions must hold simultaneously.
+    \item A \texttt{MIN\_DP\_EPOCHS} guard prevents premature disabling.
+    \item Alternative: SNR‑based detection (gradient norm / $\sigma_{\text{eff}}$) – more adaptive.
+\end{itemize}
+\end{frame}
+
+%--------------------------------------------------
+% Slide 4: Swarm Consensus & Transition
+%--------------------------------------------------
+\begin{frame}{Decentralised Vote and Cascaded Transition}
+\begin{enumerate}
+    \item A node that meets convergence criteria \textbf{casts a vote}.
+    \item Votes shared via a common scratch space (e.g., shared file, blockchain event).
+    \item DP remains active until \textbf{all} participating nodes have voted.
+    \item Once quorum is reached:
+    \begin{itemize}
+        \item DP is disabled simultaneously across the swarm.
+        \item The DP‑optimiser is replaced with a standard optimiser.
+    \end{itemize}
+\end{enumerate}
+
+\vspace{0.3cm}
+\begin{block}{Why wait for all nodes?}
+    Prevents a fast‑converging node from exposing the swarm prematurely.  
+    Ensures every data owner’s privacy is protected until their own data is no longer at risk.
+\end{block}
+\end{frame}
+
+%--------------------------------------------------
+% Slide 5: Voting Diagram
+%--------------------------------------------------
+\begin{frame}{Swarm‑Wide DP Drop Voting Procedure}
+\centering
+\includegraphics[width=0.80\textwidth,height=0.85\textheight]{voting_diagram.pdf}
+\end{frame}
+
+%--------------------------------------------------
+% Slide 6: Benefits & Expected Results
+%--------------------------------------------------
+\begin{frame}{Why Cascaded DP Outperforms Full DP}
+\begin{center}
+\begin{tabular}{@{}lccc@{}}
+\toprule
+\textbf{Metric}           & \textbf{No DP} & \textbf{Full DP} & \textbf{Cascaded DP} \\
+\midrule
+Privacy Protection        & None           & Strong            & Strong (early phase) \\
+Final Accuracy            & High           & Moderate / Low    & \textbf{High (recovers)} \\
+Training Time             & Fast           & Slow (2–10×)      & \textbf{Fast (majority)} \\
+$\varepsilon$ Consumption & 0              & High              & \textbf{Low} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\vspace{0.3cm}
+\begin{itemize}
+    \item Cascaded DP retains the privacy guarantee during the most vulnerable early epochs.
+    \item The model recovers accuracy and speeds up once DP is removed.
+    \item Total privacy budget consumed is dramatically reduced.
+\end{itemize}
+\end{frame}
 
 \end{document}
