@@ -370,29 +370,39 @@
     \end{columns}
 \end{frame}
 
-% --- Slide 3: Attacks DP Guards Against ---
-\begin{frame}{What Attacks Does DP Defend Against?}
-
+% --- Slide 3: Why DP Works ---
+\begin{frame}{Why Differential Privacy Works?}
+    
     \begin{columns}[T]
+    
         \begin{column}{0.48\textwidth}
-            \begin{block}{Gradient Inversion}
-                Noise added to gradients corrupts the signal an adversary needs to reconstruct training inputs. Even if gradients are intercepted, recovery of the original data becomes statistically infeasible.
-            \end{block}
-            \vspace{0.2cm}
-            \begin{block}{Membership Inference}
-                Clipping and noise flatten the confidence spikes that reveal whether a specific record was in the training set. The adversary's ability to determine data membership is mathematically bounded.
-            \end{block}
+        \begin{block}{Without DP}
+        \begin{itemize}
+            \item Model updates closely reflect the training data
+            \item Shared gradients contain exploitable signals
+            \item An attacker can analyze updates to infer sensitive information
+        \end{itemize}
+        \end{block}
         \end{column}
+        
         \begin{column}{0.48\textwidth}
-            \begin{block}{GAN-based Leakage}
-                When a malicious peer tries to use shared weights as a discriminator to reconstruct client data, noisy weights degrade the discriminator's fidelity — making high-quality reconstruction impossible.
-            \end{block}
-            \vspace{0.2cm}
-            \begin{alertblock}{Important Caveat}
-                DP only protects the \textit{mathematical} output. DP is a defense against inferential attacks, not data breach attacks.
-            \end{alertblock}
+        \begin{block}{With DP}
+        \begin{itemize}
+            \item Gradient clipping limits individual influence
+            \item Noise obscures exact data contributions
+            \item Shared updates reveal population-level patterns rather than individual records
+        \end{itemize}
+        \end{block}
         \end{column}
+    
     \end{columns}
+    
+    \vspace{0.3cm}
+    
+    \begin{alertblock}{}
+        DP does not hide useful learning signals entirely—it ensures that no single individual's data has a significant impact on the shared model update.
+    \end{alertblock}
+
 \end{frame}
 
 % --- Slide 4: DP in Distributed / Federated Settings ---
