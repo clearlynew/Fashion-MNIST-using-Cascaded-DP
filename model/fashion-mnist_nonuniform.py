@@ -19,7 +19,7 @@ from swarmlearning.tf import SwarmCallback
 # ─────────────────────────────────────────────────────────────────────────────
 
 batchSize       = 32
-defaultMaxEpoch = 20
+defaultMaxEpoch = 50  # Fixed to align with Stage 2 baseline deck sweeps
 defaultMinPeers = 2
 
 
@@ -288,6 +288,7 @@ def main():
 
     # ── THE EXPERIMENTAL GRID PARTITION LOGIC ─────────────────────────────────
     rng = np.random.default_rng(seed=42)
+    nodeWeightage = 50  # Sensible default
 
     if partitionMode == 'pure_iid':
         # CELL A: Balanced Volume & Shuffled Uniform Balanced Labels
@@ -300,11 +301,10 @@ def main():
         end        = len(x_train) if nodeId == numNodes - 1 else start + split_size
         x_train    = x_train[start:end]
         y_train    = y_train[start:end]
+        nodeWeightage = 50
 
     elif partitionMode == 'pure_label_skew':
         # CELL B: Pure Label Skew (Equal Total Volumes: 30,000 vs 30,000)
-        # Node 0: 80% of Classes 0-4 (4,800/class) & 20% of Classes 5-9 (1,200/class)
-        # Node 1: 20% of Classes 0-4 (1,200/class) & 80% of Classes 5-9 (4,800/class)
         node_idx = []
         for c in range(10):
             idx   = np.where(y_train == c)[0]
@@ -318,10 +318,10 @@ def main():
         rng.shuffle(node_idx)
         x_train = x_train[node_idx]
         y_train = y_train[node_idx]
+        nodeWeightage = 50
 
     elif partitionMode == 'pure_quantity_skew':
         # CELL C: Pure Quantity Skew (Uniform IID Labels, Skewed Volumes: 48,000 vs 12,000)
-        # Dataset split globally 80% to Node 0, 20% to Node 1 across all classes uniformly.
         node_idx = []
         for c in range(10):
             idx   = np.where(y_train == c)[0]
@@ -332,11 +332,10 @@ def main():
         rng.shuffle(node_idx)
         x_train = x_train[node_idx]
         y_train = y_train[node_idx]
+        nodeWeightage = 80 if nodeId == 0 else 20
 
     elif partitionMode == 'combined_skew':
         # CELL D: Combined Label + Quantity Skew (The Dominated Specialist Structure)
-        # Node 0: 48,000 samples (5,700 from classes 0-4, 3,900 from classes 5-9)
-        # Node 1: 12,000 samples (300 from classes 0-4, 2,100 from classes 5-9)
         node_idx = []
         for c in range(10):
             idx = np.where(y_train == c)[0]
@@ -351,9 +350,10 @@ def main():
         rng.shuffle(node_idx)
         x_train = x_train[node_idx]
         y_train = y_train[node_idx]
+        nodeWeightage = 80 if nodeId == 0 else 20
 
     else:
-        # Bypassed / Fallback Dirichlet Option
+        # Dirichlet Fallback Option
         alpha_env = os.getenv('DIRICHLET_ALPHA', 'inf').lower()
         if alpha_env == 'inf':
             perm    = rng.permutation(len(x_train))
@@ -365,6 +365,7 @@ def main():
             end        = len(x_train) if nodeId == numNodes - 1 else start + split_size
             x_train    = x_train[start:end]
             y_train    = y_train[start:end]
+            nodeWeightage = 50
             print(f'***** partition_mode=iid (true IID, alpha=inf) | node={nodeId}')
         else:
             alpha = float(alpha_env)
@@ -380,12 +381,18 @@ def main():
                 for n in range(numNodes):
                     node_idx[n].extend(idx[boundaries[n]:boundaries[n + 1]])
 
-            min_size  = min(len(ix) for ix in node_idx)
-            final_idx = np.array(node_idx[nodeId][:min_size])
+            # Dynamic weight calculation from shared seed simulation
+            total_samples_all_nodes = sum(len(node_idx[n]) for n in range(numNodes))
+            nodeWeightage = int(round(100 * len(node_idx[nodeId]) / total_samples_all_nodes))
+
+            # Dropped min-cut slicing completely
+            final_idx = np.array(node_idx[nodeId])
             rng.shuffle(final_idx)
             x_train = x_train[final_idx]
             y_train = y_train[final_idx]
             print(f'***** partition_mode=dirichlet (Dirichlet alpha={alpha}) | node={nodeId}')
+
+    print(f"***** Dynamic Node Weight Assignment: Node {nodeId} Weightage = {nodeWeightage}%")
 
     # NORMALIZE PIXELS
     x_train = x_train / 255.0
@@ -426,12 +433,10 @@ def main():
     train_ds = train_ds.shuffle(num_train_samples).batch(batchSize, drop_remainder=True).prefetch(tf.data.AUTOTUNE)
     val_ds   = tf.data.Dataset.from_tensor_slices((x_test, y_test)).batch(batchSize).prefetch(tf.data.AUTOTUNE)
 
-    # Dynamic system weighting mapping for backend updates
-    nodeWeightage = 80 if nodeId == 0 else 20
-
-    # SWARM CALLBACK (Hardcoded syncFrequency across all matrix positions)
+    # SWARM CALLBACK (Sync explicitly hardcoded to 1024, Adaptive Sync disabled)
     swarmCallback = SwarmCallback(
-        syncFrequency=1501,
+        syncFrequency=1024,
+        useAdaptiveSync=False,
         minPeers=minPeers,
         adsValData=val_ds,
         adsValBatchSize=batchSize,
