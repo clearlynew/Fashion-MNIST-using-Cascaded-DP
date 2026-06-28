@@ -2,7 +2,6 @@ import os
 import glob
 import json
 import time
-import pickle
 import numpy as np
 import tensorflow as tf
 from collections import deque
@@ -147,6 +146,10 @@ def main():
     numNodes = int(os.getenv('NUM_NODES', '2'))
 
     os.makedirs(scratchDir, exist_ok=True)
+
+    print('***** Starting model =', modelName)
+    print('-' * 64)
+
     (x_train, y_train), (x_test, y_test) = tf.keras.datasets.fashion_mnist.load_data()
 
     # ── PARTITIONING LOGIC ──
@@ -161,6 +164,13 @@ def main():
         start, end = nodeId * split_size, (len(x_train) if nodeId == numNodes - 1 else (nodeId + 1) * split_size)
         x_train, y_train = x_train[start:end], y_train[start:end]
         nodeWeightage = 50
+        print(f"***** partition_mode=iid | node={nodeId}")
+        print(f"***** Dynamic Node Weight Assignment: Node {nodeId} Weightage = {nodeWeightage}%")
+        print(f"***** partition_mode=iid | node={nodeId} | samples={len(x_train)}")
+        for c in range(10):
+            count = int(np.sum(y_train == c))
+            if count > 0:
+                print(f"      Class {c:2d}: {count:5d}")
     else:
         partitionMode = 'non_iid'
         alpha = float(alpha_env)
@@ -179,6 +189,13 @@ def main():
         final_idx = np.array(node_idx[nodeId])
         rng.shuffle(final_idx)
         x_train, y_train = x_train[final_idx], y_train[final_idx]
+        print(f"***** partition_mode=dirichlet (Dirichlet alpha={alpha_env}) | node={nodeId}")
+        print(f"***** Dynamic Node Weight Assignment: Node {nodeId} Weightage = {nodeWeightage}%")
+        print(f"***** partition_mode=dirichlet | node={nodeId} | samples={len(x_train)}")
+        for c in range(10):
+            count = int(np.sum(y_train == c))
+            if count > 0:
+                print(f"      Class {c:2d}: {count:5d}")
 
     x_train, x_test = x_train / 255.0, x_test / 255.0
     num_train_samples = len(x_train)
@@ -201,9 +218,11 @@ def main():
             l2_norm_clip=l2NormClip, noise_multiplier=noiseMultiplier, 
             num_microbatches=microbatches, learning_rate=actual_lr)
         loss = tf.keras.losses.CategoricalCrossentropy(from_logits=False, reduction=tf.keras.losses.Reduction.NONE)
+        print(f"***** Using DP-{'Adam' if optimizerType == 'adam' else 'SGD'} optimizer")
     else:
         optimizer = tf.keras.optimizers.Adam(learning_rate=actual_lr) if optimizerType == 'adam' else tf.keras.optimizers.SGD(learning_rate=actual_lr, momentum=0.9, nesterov=True)
         loss = tf.keras.losses.CategoricalCrossentropy(from_logits=False)
+        print(f"***** Using standard {'Adam' if optimizerType == 'adam' else 'SGD'} optimizer")
 
     model.compile(loss=loss, optimizer=optimizer, metrics=['accuracy'])
     train_ds = tf.data.Dataset.from_tensor_slices((x_train, y_train_cat)).shuffle(num_train_samples).batch(batchSize, drop_remainder=True).prefetch(tf.data.AUTOTUNE)
@@ -216,23 +235,34 @@ def main():
         cdp = CascadedDPCallback(val_ds, nodeId, numNodes, scratchDir, optimizerType, actual_lr, dpDropWindow, slopeThresh, accPlatThresh, minDpEpochs)
         callbacks.append(cdp)
 
+    print('Starting training ...')
+    train_start = time.time()
     model.fit(train_ds, epochs=maxEpoch, validation_data=val_ds, callbacks=callbacks)
+    training_time = round(time.time() - train_start, 2)
 
     # Evaluation
+    print('\nRunning final post-training evaluation on test dataset...')
     eval_res = model.evaluate(val_ds, verbose=0)
     y_true = np.concatenate([np.argmax(y, axis=1) for _, y in val_ds])
     y_pred = np.concatenate([np.argmax(model.predict_on_batch(x), axis=1) for x, _ in val_ds])
     
     eps = None
     if dpEnabled and noiseMultiplier > 0:
-        eps, _ = compute_dp_sgd_privacy(n=num_train_samples, batch_size=batchSize, noise_multiplier=noiseMultiplier, epochs=cdp.dp_drop_epoch if cdp and cdp.dp_drop_epoch else maxEpoch, delta=1.0/num_train_samples)
+        print('-' * 64)
+        print('***** PRIVACY REPORT *****')
+        delta = 1.0 / num_train_samples
+        dp_epochs = cdp.dp_drop_epoch if (cdp and cdp.dp_drop_epoch) else maxEpoch
+        eps, _ = compute_dp_sgd_privacy(n=num_train_samples, batch_size=batchSize, noise_multiplier=noiseMultiplier, epochs=dp_epochs, delta=delta)
+        print(f"Final Epsilon (ε): {eps:.4f} | Final Delta (δ): {delta:.2e}")
+        print('-' * 64)
 
     results = {
         "config": {"model_name": modelName, "node_id": nodeId, "num_nodes": numNodes, "epochs": maxEpoch, "batch_size": batchSize, "optimizer": optimizerType, "learning_rate": actual_lr, "dp_enabled": dpEnabled, "cascaded_dp": cascadedDp, "l2_norm_clip": l2NormClip, "noise_multiplier": noiseMultiplier, "microbatches": microbatches, "partition_mode": partitionMode, "num_train_samples": num_train_samples},
-        "performance": {"training_time_seconds": 0, "final_test_loss": float(eval_res[0]), "final_test_accuracy": float(eval_res[1]), "final_test_f1_macro": float(f1_score(y_true, y_pred, average='macro'))},
+        "performance": {"training_time_seconds": training_time, "final_test_loss": float(eval_res[0]), "final_test_accuracy": float(eval_res[1]), "final_test_f1_macro": float(f1_score(y_true, y_pred, average='macro'))},
         "privacy": {"epsilon": round(eps, 4) if eps is not None else None, "delta": 1.0/num_train_samples if dpEnabled else None, "dp_drop_epoch": cdp.dp_drop_epoch if cdp else None, "dp_slope_threshold": slopeThresh, "accuracy_plateau_threshold": accPlatThresh, "dp_drop_reason": cdp.dp_drop_reason if cdp else None}
     }
     
     with open(f"/results/{os.getenv('RESULT_FILE', 'results.json')}", 'w') as f: json.dump(results, f, indent=2)
+    print('Saved the trained model and verified final test metrics JSON!')
 
 if __name__ == '__main__': main()
