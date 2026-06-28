@@ -1,4 +1,4 @@
-## Results (Hima)
+## Results 
 
 # ML1
 | Dirichlet α | Method      | Training Time (s) | Accuracy (%) | F1 Macro |   Loss |       ε | DP Drop Epoch |
