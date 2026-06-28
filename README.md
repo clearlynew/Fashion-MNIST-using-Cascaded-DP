@@ -68,6 +68,14 @@ fashion-mnist/
 
 ## Setup
 
+### 0. Clone Project Repository into Workspace
+
+```bash
+cd ~/swarm-learning/workspace/
+
+git clone https://github.com/clearlynew/Fashion-MNIST-using-Cascaded-DP.git fashion-mnist
+```
+
 ### 1. Generate Certificates
 
 ```bash
