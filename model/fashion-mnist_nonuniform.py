@@ -81,6 +81,9 @@ class CascadedDPCallback(tf.keras.callbacks.Callback):
         return float(np.mean(norms))
 
     def _drop_dp(self, epoch):
+        print(f"\n***** CascadedDP: [Node {self.node_id}] SWARM QUORUM UNLOCKED *****")
+        print(f"***** CascadedDP: dropping DP globally at epoch {epoch + 1} *****")
+
         if self.optimizer_type == 'adam':
             new_optimizer = tf.keras.optimizers.Adam(learning_rate=self.learning_rate)
         else:
@@ -109,6 +112,9 @@ class CascadedDPCallback(tf.keras.callbacks.Callback):
             "val_acc_window": list(self.acc_window)
         }
 
+        print(f"***** CascadedDP: low-level execution graphs forcefully rebuilt *****")
+        print(f"***** CascadedDP: model recompiled with standard optimizer *****\n")
+
     def on_epoch_end(self, epoch, logs=None):
         if not self.dp_active: return
         val_acc = (logs or {}).get('val_accuracy')
@@ -118,8 +124,15 @@ class CascadedDPCallback(tf.keras.callbacks.Callback):
         self.grad_norm_window.append(grad_norm)
         self.acc_window.append(val_acc)
         self.grad_history.append(float(grad_norm))
-        self.rolling_history.append(float(np.mean(self.grad_norm_window)))
+        
+        rolling_mean = float(np.mean(self.grad_norm_window))
+        self.rolling_history.append(rolling_mean)
         self.acc_history.append(float(val_acc))
+
+        print(
+            f"  [CascadedDP] Node={self.node_id} | epoch={epoch + 1} | "
+            f"grad_norm={grad_norm:.6f} | rolling_mean={rolling_mean:.6f} | val_acc={val_acc:.4f}"
+        )
 
         if epoch + 1 < self.min_dp_epochs or len(self.grad_norm_window) < self.window_size: return
 
@@ -128,9 +141,16 @@ class CascadedDPCallback(tf.keras.callbacks.Callback):
 
         if relative_slope < self.slope_threshold and acc_variance < self.acc_plateau_threshold:
             if not os.path.exists(self.vote_file):
-                with open(self.vote_file, 'w') as f: f.write("vote")
+                try:
+                    with open(self.vote_file, 'w') as f: f.write(f"Node {self.node_id} converged at epoch {epoch + 1}")
+                    print(f"  [CascadedDP-Consensus] Node {self.node_id} posted drop vote to shared scratch.")
+                except Exception as e:
+                    print(f"  [CascadedDP-Consensus] Error writing vote file: {e}")
 
         total_votes = sum(1 for i in range(self.num_nodes) if os.path.exists(os.path.join(self.scratch_dir, f".vote_drop_dp_node_{i}")))
+        
+        print(f"  [CascadedDP-Quorum] Node {self.node_id} reporting cluster status: {total_votes}/{self.num_nodes} votes collected.")
+
         if total_votes == self.num_nodes:
             time.sleep(self.node_id * 0.2)
             self._drop_dp(epoch)
