@@ -1,6 +1,5 @@
 # Fashion-MNIST — CascadedDP with Non-Uniform Partitioning
 
-=========================================================
 
 This example trains a Fashion-MNIST classifier across a two-node HPE Swarm Learning setup using **CascadedDP**: training begins with Differential Privacy (DP) active, and DP is automatically dropped once convergence is detected via a decentralized weight parameter consensus protocol. Data is partitioned using a **Dirichlet distribution** to simulate non-IID heterogeneity.
 
