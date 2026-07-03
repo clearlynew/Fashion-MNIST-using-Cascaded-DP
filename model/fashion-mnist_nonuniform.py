@@ -34,18 +34,44 @@ defaultMaxEpoch = 50
 defaultMinPeers = 2
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DECENTRALIZED CASCADED DP CALLBACK (SWARM CONSENSUS)
+# MODEL PARAMETER-BASED COUPLING LAYER
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ConvergenceFlagLayer(tf.keras.layers.Layer):
+    """
+    Wraps the dummy non-trainable weight in an actual Layer so it shows up
+    under model.layers -> layer.weights, matching how SL's SwarmCallback
+    enumerates weightNames. 
+    
+    Since call(x) returns x unchanged, appending this to a Sequential model
+    preserves metrics and predictions completely while providing a cross-host
+    communication channel via standard weight-merging.
+    """
+    def __init__(self):
+        super().__init__(name="convergence_flag_layer")
+        self.flag = self.add_weight(
+            name="convergence_flag",
+            shape=(1,),
+            initializer="zeros",
+            trainable=False,
+        )
+
+    def call(self, x):
+        return x
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DECENTRALIZED CASCADED DP CALLBACK (SWARM PARAMETER CONSENSUS)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class CascadedDPCallback(tf.keras.callbacks.Callback):
-    def __init__(self, val_ds, node_id, num_nodes, scratch_dir, optimizer_type='sgd', 
+    def __init__(self, val_ds, node_id, num_nodes, flag_layer, optimizer_type='sgd', 
                  learning_rate=0.01, window_size=5, slope_threshold=0.015, 
                  acc_plateau_threshold=0.0005, min_dp_epochs=5):
         super().__init__()
         self.val_ds = val_ds
         self.node_id = node_id
         self.num_nodes = num_nodes
-        self.scratch_dir = scratch_dir
+        self.flag_layer = flag_layer
         self.optimizer_type = optimizer_type
         self.learning_rate = learning_rate
         self.window_size = window_size
@@ -61,11 +87,7 @@ class CascadedDPCallback(tf.keras.callbacks.Callback):
         self.dp_active = True
         self.dp_drop_epoch = None
         self.dp_drop_reason = None
-        self.vote_file = os.path.join(self.scratch_dir, f".vote_drop_dp_node_{self.node_id}")
-
-        if os.path.exists(self.vote_file):
-            try: os.remove(self.vote_file)
-            except: pass
+        self.local_converged = False
 
         self._measure_loss = tf.keras.losses.CategoricalCrossentropy(from_logits=False)
 
@@ -81,7 +103,7 @@ class CascadedDPCallback(tf.keras.callbacks.Callback):
         return float(np.mean(norms))
 
     def _drop_dp(self, epoch):
-        print(f"\n***** CascadedDP: [Node {self.node_id}] SWARM QUORUM UNLOCKED *****")
+        print(f"\n***** CascadedDP: [Node {self.node_id}] SWARM PARAMETER QUORUM UNLOCKED *****")
         print(f"***** CascadedDP: dropping DP globally at epoch {epoch + 1} *****")
 
         if self.optimizer_type == 'adam':
@@ -139,19 +161,22 @@ class CascadedDPCallback(tf.keras.callbacks.Callback):
         relative_slope = abs(self.rolling_history[-2] - self.rolling_history[-1]) / self.rolling_history[-2] if len(self.rolling_history) >= 2 else 1.0
         acc_variance = float(np.var(self.acc_window))
 
+        # Evaluate local convergence criteria
         if relative_slope < self.slope_threshold and acc_variance < self.acc_plateau_threshold:
-            if not os.path.exists(self.vote_file):
-                try:
-                    with open(self.vote_file, 'w') as f: f.write(f"Node {self.node_id} converged at epoch {epoch + 1}")
-                    print(f"  [CascadedDP-Consensus] Node {self.node_id} posted drop vote to shared scratch.")
-                except Exception as e:
-                    print(f"  [CascadedDP-Consensus] Error writing vote file: {e}")
+            if not self.local_converged:
+                self.local_converged = True
+                # Flip this node's weight parameter value to 1.0
+                self.flag_layer.flag.assign([1.0])
+                print(f"  [CascadedDP-Consensus] Node {self.node_id} local convergence met. Set local flag weight to 1.0.")
 
-        total_votes = sum(1 for i in range(self.num_nodes) if os.path.exists(os.path.join(self.scratch_dir, f".vote_drop_dp_node_{i}")))
+        # Read the averaged weight parameter state distributed across the Swarm network
+        global_flag_value = float(self.flag_layer.flag.numpy()[0])
+        converged_peers = int(round(global_flag_value * self.num_nodes))
         
-        print(f"  [CascadedDP-Quorum] Node {self.node_id} reporting cluster status: {total_votes}/{self.num_nodes} votes collected.")
+        print(f"  [CascadedDP-Quorum] Node {self.node_id} tracking global parameter value: {global_flag_value:.4f} ({converged_peers}/{self.num_nodes} nodes converged).")
 
-        if total_votes == self.num_nodes:
+        # Quorum is reached only when ALL nodes have set their local flag parameter to 1.0 (mean == 1.0)
+        if global_flag_value >= 0.999:
             time.sleep(self.node_id * 0.2)
             self._drop_dp(epoch)
 
@@ -161,7 +186,6 @@ class CascadedDPCallback(tf.keras.callbacks.Callback):
 
 def main():
     modelName = 'fashion-mnist'
-    scratchDir = os.getenv('SCRATCH_DIR', '/platform/scratch')
     maxEpoch = int(os.getenv('MAX_EPOCHS', str(defaultMaxEpoch)))
     minPeers = int(os.getenv('MIN_PEERS', str(defaultMinPeers)))
     dpEnabled = os.getenv('DP_ENABLED', 'false').lower() == 'true'
@@ -178,8 +202,6 @@ def main():
     accPlatThresh = float(os.getenv('ACC_PLATEAU_THRESHOLD', '0.0005'))
     nodeId = int(os.getenv('NODE_ID', '0'))
     numNodes = int(os.getenv('NUM_NODES', '2'))
-
-    os.makedirs(scratchDir, exist_ok=True)
 
     print('***** Starting model =', modelName)
     print('-' * 64)
@@ -236,6 +258,9 @@ def main():
     y_train_cat = tf.keras.utils.to_categorical(y_train, 10)
     y_test_cat = tf.keras.utils.to_categorical(y_test, 10)
 
+    # Initialize the tracking layer instance
+    flag_layer = ConvergenceFlagLayer()
+
     model = tf.keras.models.Sequential([
         tf.keras.layers.Flatten(input_shape=(28, 28)),
         tf.keras.layers.Dense(128, activation='relu'),
@@ -243,7 +268,8 @@ def main():
         tf.keras.layers.Dense(64, activation='relu'),
         tf.keras.layers.Dropout(0.3),
         tf.keras.layers.Dense(32, activation='relu'),
-        tf.keras.layers.Dense(10, activation='softmax')
+        tf.keras.layers.Dense(10, activation='softmax'),
+        flag_layer  # Injected directly to become reachable by Swarm Learning's weight names enumeration
     ])
 
     if dpEnabled:
@@ -266,7 +292,7 @@ def main():
     
     cdp = None
     if dpEnabled and cascadedDp:
-        cdp = CascadedDPCallback(val_ds, nodeId, numNodes, scratchDir, optimizerType, actual_lr, dpDropWindow, slopeThresh, accPlatThresh, minDpEpochs)
+        cdp = CascadedDPCallback(val_ds, nodeId, numNodes, flag_layer, optimizerType, actual_lr, dpDropWindow, slopeThresh, accPlatThresh, minDpEpochs)
         callbacks.append(cdp)
 
     print('Starting training ...')
