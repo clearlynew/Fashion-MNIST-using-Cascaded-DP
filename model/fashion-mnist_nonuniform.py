@@ -29,9 +29,9 @@ from swarmlearning.tf import SwarmCallback
 # CONFIGURABLE PARAMETERS
 # ─────────────────────────────────────────────────────────────────────────────
 
-batchSize = 32
-defaultMaxEpoch = 50
-defaultMinPeers = 2
+batchSize = 32            # Fixed mini-batch size for both training and DP microbatching
+defaultMaxEpoch = 50       # Fallback if MAX_EPOCHS env var isn't set
+defaultMinPeers = 2        # Fallback minimum peer count for SwarmCallback to start a sync round
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MODEL PARAMETER-BASED COUPLING LAYER
@@ -46,17 +46,32 @@ class ConvergenceFlagLayer(tf.keras.layers.Layer):
     Since call(x) returns x unchanged, appending this to a Sequential model
     preserves metrics and predictions completely while providing a cross-host
     communication channel via standard weight-merging.
+
+    NOTE: this only works as a consensus channel if SwarmCallback's
+    mergeMethod='mean' actually averages non-trainable weights along with
+    trainable ones. That behavior isn't part of any documented contract here,
+    so if SwarmCallback ever changes to merge only trainable variables, the
+    flag will stay stuck at each node's local value and quorum will never be
+    detected (silently — no error, just DP that never drops).
     """
     def __init__(self):
         super().__init__(name="convergence_flag_layer")
+        # Single scalar weight, initialized to 0.0. Each node flips its own
+        # copy to 1.0 once it has locally converged (see CascadedDPCallback).
+        # Because SwarmCallback merges weights across peers by averaging,
+        # this scalar doubles as a distributed "vote": the merged value is
+        # exactly 1.0 only when every peer has voted, giving cheap quorum
+        # detection without any extra coordination service.
         self.flag = self.add_weight(
             name="convergence_flag",
             shape=(1,),
             initializer="zeros",
-            trainable=False,
+            trainable=False,   # keeps it out of gradient computation entirely
         )
 
     def call(self, x):
+        # Pass-through: this layer exists purely to hold state, not to
+        # transform activations, so predictions/metrics are unaffected.
         return x
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -64,34 +79,49 @@ class ConvergenceFlagLayer(tf.keras.layers.Layer):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class CascadedDPCallback(tf.keras.callbacks.Callback):
+    """
+    Monitors local training dynamics each epoch to decide when DP noise has
+    stopped being necessary (gradients have flattened out and validation
+    accuracy has plateaued), then uses the swarm-averaged ConvergenceFlagLayer
+    to make sure *every* node agrees before anyone actually drops DP and
+    recompiles with a plain (non-private) optimizer.
+    """
     def __init__(self, val_ds, node_id, num_nodes, flag_layer, optimizer_type='sgd', 
                  learning_rate=0.01, window_size=5, slope_threshold=0.015, 
                  acc_plateau_threshold=0.0005, min_dp_epochs=5):
         super().__init__()
-        self.val_ds = val_ds
-        self.node_id = node_id
-        self.num_nodes = num_nodes
-        self.flag_layer = flag_layer
-        self.optimizer_type = optimizer_type
-        self.learning_rate = learning_rate
-        self.window_size = window_size
-        self.slope_threshold = slope_threshold
-        self.acc_plateau_threshold = acc_plateau_threshold
-        self.min_dp_epochs = min_dp_epochs
+        self.val_ds = val_ds                              # held-out data used both for grad-norm probing and convergence checks
+        self.node_id = node_id                             # this node's index, used only for logging now that sleep staggering is removed
+        self.num_nodes = num_nodes                         # total peers; used to interpret the averaged flag value as a vote count
+        self.flag_layer = flag_layer                       # shared non-trainable weight synced via SwarmCallback's weight merge
+        self.optimizer_type = optimizer_type               # 'sgd' or 'adam', determines which optimizer to rebuild with post-DP
+        self.learning_rate = learning_rate                 # LR to use for the plain optimizer after DP is dropped
+        self.window_size = window_size                     # number of recent epochs considered for the rolling grad-norm mean / accuracy variance
+        self.slope_threshold = slope_threshold             # relative change in rolling grad-norm mean below which gradients are "flat"
+        self.acc_plateau_threshold = acc_plateau_threshold  # variance of val accuracy over the window below which accuracy has "plateaued"
+        self.min_dp_epochs = min_dp_epochs                 # minimum epochs DP must run before convergence checks even start
 
-        self.grad_norm_window = deque(maxlen=window_size)
-        self.acc_window = deque(maxlen=window_size)
-        self.grad_history = []
-        self.rolling_history = []
-        self.acc_history = []
-        self.dp_active = True
-        self.dp_drop_epoch = None
-        self.dp_drop_reason = None
-        self.local_converged = False
+        self.grad_norm_window = deque(maxlen=window_size)   # rolling buffer of raw per-epoch grad norms
+        self.acc_window = deque(maxlen=window_size)          # rolling buffer of per-epoch val accuracy
+        self.grad_history = []                               # full history of grad norms (for the results/debug record)
+        self.rolling_history = []                            # full history of the rolling mean grad norm
+        self.acc_history = []                                 # full history of val accuracy
+        self.dp_active = True                                 # flips to False once this node has recompiled without DP
+        self.dp_drop_epoch = None                             # epoch (1-indexed) at which DP was dropped, used later for epsilon accounting
+        self.dp_drop_reason = None                            # snapshot of the metrics that triggered the drop, for the results JSON
+        self.local_converged = False                          # guards against re-flipping the flag weight every epoch once converged
 
+        # Used only to compute a gradient-norm signal; not the actual training loss
         self._measure_loss = tf.keras.losses.CategoricalCrossentropy(from_logits=False)
 
     def _compute_grad_norm(self):
+        """
+        Probes the current gradient magnitude on a handful of validation
+        batches (not used for actual weight updates) to get a cheap signal
+        of how much the model is still "moving". Averaged over 5 batches to
+        smooth out per-batch noise. training=True is intentional here so
+        dropout etc. behave the same way they do during real training steps.
+        """
         norms = []
         for x, y in self.val_ds.take(5):
             with tf.GradientTape() as tape:
@@ -103,18 +133,36 @@ class CascadedDPCallback(tf.keras.callbacks.Callback):
         return float(np.mean(norms))
 
     def _drop_dp(self, epoch):
+        """
+        Called once global quorum is reached (see on_epoch_end). Swaps the
+        DP optimizer out for a plain one and forces Keras to rebuild its
+        compiled train/test/predict graphs, since simply swapping
+        self.model.optimizer would leave the old DP-wrapped train_function
+        cached and still in effect.
+        """
         print(f"\n***** CascadedDP: [Node {self.node_id}] SWARM PARAMETER QUORUM UNLOCKED *****")
         print(f"***** CascadedDP: dropping DP globally at epoch {epoch + 1} *****")
 
+        # Rebuild with the same optimizer family the run started with, but
+        # without any DP wrapping (no clipping/noise).
         if self.optimizer_type == 'adam':
             new_optimizer = tf.keras.optimizers.Adam(learning_rate=self.learning_rate)
         else:
             new_optimizer = tf.keras.optimizers.SGD(learning_rate=self.learning_rate, momentum=0.9, nesterov=True)
 
+        # Recompiling gives the model a fresh optimizer (no leftover
+        # momentum/state from the DP optimizer) and switches the loss back
+        # to a standard mean-reduced CategoricalCrossentropy, since the DP
+        # optimizer required per-example (unreduced) loss for microbatching.
         self.model.compile(loss=tf.keras.losses.CategoricalCrossentropy(from_logits=False),
                            optimizer=new_optimizer,
                            metrics=[tf.keras.metrics.CategoricalAccuracy(name='accuracy')])
 
+        # model.compile() alone doesn't discard Keras's cached, traced
+        # tf.function graphs for train/test/predict steps — those still
+        # reference the old DP optimizer's step logic. Clearing them and
+        # forcing a rebuild ensures subsequent fit() steps actually use the
+        # new plain-optimizer graph.
         if hasattr(self.model, 'train_function'):
             self.model.train_function = None
             self.model.test_function = None
@@ -126,6 +174,8 @@ class CascadedDPCallback(tf.keras.callbacks.Callback):
 
         self.dp_active = False
         self.dp_drop_epoch = epoch + 1
+        # Snapshot of the exact metrics that triggered the drop, kept for
+        # the final results JSON / post-hoc debugging.
         self.dp_drop_reason = {
             "epoch": epoch + 1,
             "slope_threshold": self.slope_threshold,
@@ -138,10 +188,15 @@ class CascadedDPCallback(tf.keras.callbacks.Callback):
         print(f"***** CascadedDP: model recompiled with standard optimizer *****\n")
 
     def on_epoch_end(self, epoch, logs=None):
+        # Once this node has already dropped DP there's nothing left to
+        # monitor — the rest of training proceeds with the plain optimizer.
         if not self.dp_active: return
+
         val_acc = (logs or {}).get('val_accuracy')
         if val_acc is None: return
 
+        # Update rolling signals: gradient norm (are we still learning?) and
+        # validation accuracy (has performance leveled off?).
         grad_norm = self._compute_grad_norm()
         self.grad_norm_window.append(grad_norm)
         self.acc_window.append(val_acc)
@@ -156,28 +211,41 @@ class CascadedDPCallback(tf.keras.callbacks.Callback):
             f"grad_norm={grad_norm:.6f} | rolling_mean={rolling_mean:.6f} | val_acc={val_acc:.4f}"
         )
 
+        # Don't evaluate convergence until DP has run for a minimum number
+        # of epochs and the rolling window is full (avoids acting on noisy
+        # early-training signals).
         if epoch + 1 < self.min_dp_epochs or len(self.grad_norm_window) < self.window_size: return
 
+        # How much the rolling grad-norm mean changed vs. the previous
+        # epoch, as a fraction of its previous value — a flattening slope
+        # means the model has mostly stopped moving.
         relative_slope = abs(self.rolling_history[-2] - self.rolling_history[-1]) / self.rolling_history[-2] if len(self.rolling_history) >= 2 else 1.0
+        # Variance of val accuracy across the window — low variance means
+        # accuracy has plateaued rather than still trending up/down.
         acc_variance = float(np.var(self.acc_window))
 
         # Evaluate local convergence criteria
         if relative_slope < self.slope_threshold and acc_variance < self.acc_plateau_threshold:
             if not self.local_converged:
                 self.local_converged = True
-                # Flip this node's weight parameter value to 1.0
+                # Flip this node's weight parameter value to 1.0. This
+                # change only becomes visible to other nodes once
+                # SwarmCallback performs its next weight merge — it is not
+                # instantaneous.
                 self.flag_layer.flag.assign([1.0])
                 print(f"  [CascadedDP-Consensus] Node {self.node_id} local convergence met. Set local flag weight to 1.0.")
 
-        # Read the averaged weight parameter state distributed across the Swarm network
+        # Read the averaged weight parameter state distributed across the Swarm network.
+        # Because the merge averages every peer's flag (0.0 or 1.0), this
+        # value is a direct proxy for "fraction of peers converged so far".
         global_flag_value = float(self.flag_layer.flag.numpy()[0])
         converged_peers = int(round(global_flag_value * self.num_nodes))
         
         print(f"  [CascadedDP-Quorum] Node {self.node_id} tracking global parameter value: {global_flag_value:.4f} ({converged_peers}/{self.num_nodes} nodes converged).")
 
-        # Quorum is reached only when ALL nodes have set their local flag parameter to 1.0 (mean == 1.0)
+        # Quorum is reached only when ALL nodes have set their local flag parameter to 1.0 (mean == 1.0).
+        # 0.999 rather than an exact 1.0 comparison to allow for floating-point merge/round-trip error.
         if global_flag_value >= 0.999:
-            time.sleep(self.node_id * 0.2)
             self._drop_dp(epoch)
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -186,22 +254,22 @@ class CascadedDPCallback(tf.keras.callbacks.Callback):
 
 def main():
     modelName = 'fashion-mnist'
-    maxEpoch = int(os.getenv('MAX_EPOCHS', str(defaultMaxEpoch)))
-    minPeers = int(os.getenv('MIN_PEERS', str(defaultMinPeers)))
-    dpEnabled = os.getenv('DP_ENABLED', 'false').lower() == 'true'
-    noiseMultiplier = float(os.getenv('NOISE_MULTIPLIER', '0.0'))
-    l2NormClip = float(os.getenv('L2_NORM_CLIP', '1.0'))
-    microbatches = int(os.getenv('MICROBATCHES', str(batchSize)))
-    optimizerType = os.getenv('OPTIMIZER', 'sgd').lower()
-    learningRate = float(os.getenv('LEARNING_RATE', '0'))
+    maxEpoch = int(os.getenv('MAX_EPOCHS', str(defaultMaxEpoch)))          # total training epochs
+    minPeers = int(os.getenv('MIN_PEERS', str(defaultMinPeers)))            # min peers SwarmCallback needs before it will sync
+    dpEnabled = os.getenv('DP_ENABLED', 'false').lower() == 'true'          # whether to train with DP-SGD at all
+    noiseMultiplier = float(os.getenv('NOISE_MULTIPLIER', '0.0'))           # DP noise scale (0 = clipping only, no privacy noise)
+    l2NormClip = float(os.getenv('L2_NORM_CLIP', '1.0'))                    # per-example gradient clipping norm for DP-SGD
+    microbatches = int(os.getenv('MICROBATCHES', str(batchSize)))           # DP microbatch count; defaults to one microbatch per example group of batchSize
+    optimizerType = os.getenv('OPTIMIZER', 'sgd').lower()                   # 'sgd' or 'adam'
+    learningRate = float(os.getenv('LEARNING_RATE', '0'))                   # 0 means "use the optimizer-specific default" below
     actual_lr = learningRate or (0.001 if optimizerType == 'adam' else 0.01)
-    cascadedDp = os.getenv('CASCADED_DP', 'false').lower() == 'true'
-    dpDropWindow = int(os.getenv('DP_DROP_WINDOW', '5'))
-    minDpEpochs = int(os.getenv('MIN_DP_EPOCHS', '5'))
-    slopeThresh = float(os.getenv('DP_SLOPE_THRESHOLD', '0.015'))
-    accPlatThresh = float(os.getenv('ACC_PLATEAU_THRESHOLD', '0.0005'))
-    nodeId = int(os.getenv('NODE_ID', '0'))
-    numNodes = int(os.getenv('NUM_NODES', '2'))
+    cascadedDp = os.getenv('CASCADED_DP', 'false').lower() == 'true'        # whether to enable the auto-drop-DP-on-convergence mechanism
+    dpDropWindow = int(os.getenv('DP_DROP_WINDOW', '5'))                    # rolling window size (epochs) used by CascadedDPCallback
+    minDpEpochs = int(os.getenv('MIN_DP_EPOCHS', '5'))                      # minimum epochs before convergence checks can trigger a drop
+    slopeThresh = float(os.getenv('DP_SLOPE_THRESHOLD', '0.015'))           # relative grad-norm slope threshold for "flattened"
+    accPlatThresh = float(os.getenv('ACC_PLATEAU_THRESHOLD', '0.0005'))     # val-accuracy variance threshold for "plateaued"
+    nodeId = int(os.getenv('NODE_ID', '0'))                                 # this node's index within the swarm
+    numNodes = int(os.getenv('NUM_NODES', '2'))                             # total number of participating nodes
 
     print('***** Starting model =', modelName)
     print('-' * 64)
@@ -209,16 +277,27 @@ def main():
     (x_train, y_train), (x_test, y_test) = tf.keras.datasets.fashion_mnist.load_data()
 
     # ── PARTITIONING LOGIC ──
+    # Fixed seed so every node deterministically derives the same global
+    # permutation/proportions and therefore ends up with a disjoint,
+    # reproducible shard of the training data.
     rng = np.random.default_rng(seed=42)
     alpha_env = os.getenv('DIRICHLET_ALPHA', 'inf').lower()
 
     if alpha_env == 'inf':
+        # alpha=inf is the standard shorthand for "uniform/IID" partitioning:
+        # shuffle everything, then cut into numNodes equal contiguous chunks.
         partitionMode = 'iid'
         perm = rng.permutation(len(x_train))
         x_train, y_train = x_train[perm], y_train[perm]
         split_size = len(x_train) // numNodes
+        # Last node absorbs any remainder from the integer division so no
+        # samples are dropped.
         start, end = nodeId * split_size, (len(x_train) if nodeId == numNodes - 1 else (nodeId + 1) * split_size)
         x_train, y_train = x_train[start:end], y_train[start:end]
+        # NOTE: hardcoded to 50%, which is only correct for numNodes == 2.
+        # For numNodes > 2 under IID partitioning each node should get
+        # ~100/numNodes percent (all shards are equal size here), so this
+        # should really be round(100 / numNodes).
         nodeWeightage = 50
         print(f"***** partition_mode=iid | node={nodeId}")
         print(f"***** Dynamic Node Weight Assignment: Node {nodeId} Weightage = {nodeWeightage}%")
@@ -228,18 +307,28 @@ def main():
             if count > 0:
                 print(f"      Class {c:2d}: {count:5d}")
     else:
+        # Dirichlet-alpha partitioning: simulates non-IID/heterogeneous data
+        # across nodes. Lower alpha -> more skewed class distribution per
+        # node; higher alpha -> closer to IID.
         partitionMode = 'non_iid'
         alpha = float(alpha_env)
         node_idx = [[] for _ in range(numNodes)]
         for c in range(10):
+            # For each class independently, draw a Dirichlet split across
+            # nodes and hand out that class's sample indices accordingly.
             idx = np.where(y_train == c)[0]
             rng.shuffle(idx)
             proportions = rng.dirichlet(alpha=np.full(numNodes, alpha))
             splits = (proportions * len(idx)).astype(int)
+            # Fix up rounding: give the last node whatever's left over so
+            # every sample of this class is assigned to exactly one node.
             splits[-1] = len(idx) - splits[:-1].sum()
             bounds = np.concatenate([[0], np.cumsum(splits)])
             for n in range(numNodes): node_idx[n].extend(idx[bounds[n]:bounds[n+1]])
         
+        # This node's actual share of the full training set, used both for
+        # logging and as the weight SwarmCallback uses when merging models
+        # (so a node with more data gets proportionally more influence).
         total = sum(len(node_idx[n]) for n in range(numNodes))
         nodeWeightage = int(round(100 * len(node_idx[nodeId]) / total))
         final_idx = np.array(node_idx[nodeId])
@@ -253,14 +342,19 @@ def main():
             if count > 0:
                 print(f"      Class {c:2d}: {count:5d}")
 
-    x_train, x_test = x_train / 255.0, x_test / 255.0
+    x_train, x_test = x_train / 255.0, x_test / 255.0   # scale pixel values to [0, 1]
     num_train_samples = len(x_train)
-    y_train_cat = tf.keras.utils.to_categorical(y_train, 10)
+    y_train_cat = tf.keras.utils.to_categorical(y_train, 10)  # one-hot labels for CategoricalCrossentropy
     y_test_cat = tf.keras.utils.to_categorical(y_test, 10)
 
-    # Initialize the tracking layer instance
+    # Initialize the tracking layer instance. Created before the model so
+    # the same Python object reference can be handed to both the Sequential
+    # model (for weight merging) and CascadedDPCallback (for reading/setting
+    # the flag directly).
     flag_layer = ConvergenceFlagLayer()
 
+    # Plain feed-forward classifier: 784 -> 128 -> 64 -> 32 -> 10, with
+    # dropout for regularization between the first two dense layers.
     model = tf.keras.models.Sequential([
         tf.keras.layers.Flatten(input_shape=(28, 28)),
         tf.keras.layers.Dense(128, activation='relu'),
@@ -273,10 +367,15 @@ def main():
     ])
 
     if dpEnabled:
+        # DP-SGD variants: clip per-example gradients to l2NormClip, add
+        # Gaussian noise scaled by noiseMultiplier, and average over
+        # microbatches groups.
         from tensorflow_privacy.privacy.optimizers.dp_optimizer_keras import DPKerasAdamOptimizer, DPKerasSGDOptimizer
         optimizer = (DPKerasAdamOptimizer if optimizerType == 'adam' else DPKerasSGDOptimizer)(
             l2_norm_clip=l2NormClip, noise_multiplier=noiseMultiplier, 
             num_microbatches=microbatches, learning_rate=actual_lr)
+        # DP optimizers need per-example (unreduced) loss values to clip
+        # each example's gradient individually before aggregating.
         loss = tf.keras.losses.CategoricalCrossentropy(from_logits=False, reduction=tf.keras.losses.Reduction.NONE)
         print(f"***** Using DP-{'Adam' if optimizerType == 'adam' else 'SGD'} optimizer")
     else:
@@ -288,10 +387,15 @@ def main():
     train_ds = tf.data.Dataset.from_tensor_slices((x_train, y_train_cat)).shuffle(num_train_samples).batch(batchSize, drop_remainder=True).prefetch(tf.data.AUTOTUNE)
     val_ds = tf.data.Dataset.from_tensor_slices((x_test, y_test_cat)).batch(batchSize).prefetch(tf.data.AUTOTUNE)
 
+    # SwarmCallback drives the actual decentralized training: it syncs and
+    # merges model weights across peers every syncFrequency batches, using
+    # nodeWeightage to weight each peer's contribution to the merge.
     callbacks = [SwarmCallback(syncFrequency=1024, useAdaptiveSync=False, minPeers=minPeers, adsValData=val_ds, adsValBatchSize=batchSize, mergeMethod='mean', nodeWeightage=nodeWeightage, totalEpochs=maxEpoch)]
     
     cdp = None
     if dpEnabled and cascadedDp:
+        # Only meaningful when DP is actually enabled — cascadedDp has
+        # nothing to "drop" otherwise.
         cdp = CascadedDPCallback(val_ds, nodeId, numNodes, flag_layer, optimizerType, actual_lr, dpDropWindow, slopeThresh, accPlatThresh, minDpEpochs)
         callbacks.append(cdp)
 
