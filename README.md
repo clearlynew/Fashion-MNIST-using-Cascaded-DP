@@ -1,7 +1,7 @@
 # Fashion-MNIST — CascadedDP with Non-Uniform Partitioning
 
 
-This example trains a Fashion-MNIST classifier across a two-node HPE Swarm Learning setup using **CascadedDP**: training begins with Differential Privacy (DP) active, and DP is automatically dropped once convergence is detected via a decentralized weight parameter consensus protocol. Data is partitioned using a **Dirichlet distribution** to simulate non-IID heterogeneity.
+This example trains a Fashion-MNIST classifier across a two-node HPE Swarm Learning setup using **CascadedDP**: training begins with Differential Privacy (DP) active, and DP is automatically dropped once convergence is detected via a decentralized weight parameter consensus protocol. Data is partitioned using a **Dirichlet distribution** to simulate non-IID heterogeneity. The model is a standard small CNN (matching the TF Privacy / Opacus canonical DP-SGD benchmark architecture for MNIST/Fashion-MNIST), not a plain MLP.
 
 The ML program is in `workspace/fashion-mnist/model` and is called `fashion-mnist_nonuniform.py`.
 
@@ -59,9 +59,9 @@ fashion-mnist/
 | `MICROBATCHES` | `32` | Microbatch size for DP optimizer |
 | `CASCADED_DP` | `false` | Enable convergence-triggered DP drop |
 | `DP_DROP_WINDOW` | `5` | Rolling window size for convergence signals |
-| `MIN_DP_EPOCHS` | `5` | Minimum epochs before DP drop is considered |
-| `DP_SLOPE_THRESHOLD` | `0.01` | Relative gradient norm slope threshold for convergence |
-| `ACC_PLATEAU_THRESHOLD` | `0.0005` | Validation accuracy variance threshold for convergence |
+| `MIN_DP_EPOCHS` | `5` | Minimum epochs before DP drop is considered; also the burn-in period used to estimate the noise floor for K_SLOPE/K_ACC |
+| `K_SLOPE` | `1.0` | Multiplier on the burn-in gradient-norm std dev; convergence triggers when the rolling slope magnitude falls below `K_SLOPE × burn_in_std`. Self-scaling — not a raw threshold, sweep this instead |
+| `K_ACC` | `1.0` | Multiplier on the burn-in validation-accuracy variance; convergence triggers when windowed accuracy variance falls below `K_ACC × burn_in_variance`. Self-scaling — not a raw threshold, sweep this instead |
 | `DIRICHLET_ALPHA` | `inf` | Dirichlet alpha for partitioning (`inf` = IID) |
 | `RESULT_FILE` | `results.json` | Output JSON filename under `/results/` |
 
@@ -422,8 +422,8 @@ docker logs -f ml2 > \
 --ml-e CASCADED_DP=true \
 --ml-e DP_DROP_WINDOW=5 \
 --ml-e MIN_DP_EPOCHS=5 \
---ml-e DP_SLOPE_THRESHOLD=0.01 \
---ml-e ACC_PLATEAU_THRESHOLD=0.0005 \
+--ml-e K_SLOPE=1.0 \
+--ml-e K_ACC=1.0 \
 --apls-ip=${APLS_IP}
 
 ```
@@ -469,8 +469,8 @@ docker logs -f ml1 > \
 --ml-e CASCADED_DP=true \
 --ml-e DP_DROP_WINDOW=5 \
 --ml-e MIN_DP_EPOCHS=5 \
---ml-e DP_SLOPE_THRESHOLD=0.01 \
---ml-e ACC_PLATEAU_THRESHOLD=0.0005 \
+--ml-e K_SLOPE=1.0 \
+--ml-e K_ACC=1.0 \
 --apls-ip=${APLS_IP}
 
 ```
@@ -489,12 +489,14 @@ Result JSON files will be saved under `workspace/fashion-mnist/results/`. To cle
 
 ## How CascadedDP Works
 
-Training starts with the DP optimizer active. After `MIN_DP_EPOCHS` epochs, each node monitors two local signals every epoch:
+Training starts with the DP optimizer active. During the first `MIN_DP_EPOCHS` epochs (burn-in), each node collects raw gradient-norm and validation-accuracy samples and uses them to estimate a local **noise floor** — the standard deviation of gradient norms and the variance of validation accuracy naturally observed during burn-in. This makes the convergence trigger self-scaling to how noisy this particular dataset/architecture/window combination actually is, rather than relying on hand-picked absolute constants.
 
-* **Relative gradient norm slope** — the fractional change in the rolling mean of gradient norms across the last `DP_DROP_WINDOW` epochs.
-* **Validation accuracy variance** — variance of validation accuracy over the same window.
+After burn-in, each node monitors two signals every epoch, each compared against its own burn-in noise floor:
 
-When both signals fall below their respective thresholds (`DP_SLOPE_THRESHOLD` and `ACC_PLATEAU_THRESHOLD`), the node trips its consensus flag by changing an internal, non-trainable tracking model parameter from `0.0` to `1.0` via a custom model layer (`ConvergenceFlagLayer`).
+* **Gradient norm slope** — absolute change in the rolling mean of gradient norms across the last `DP_DROP_WINDOW` epochs, compared against `K_SLOPE × burn_in_std_grad`.
+* **Validation accuracy variance** — variance of validation accuracy over the same window, compared against `K_ACC × burn_in_var_acc`.
+
+When both signals fall below their respective self-scaled thresholds, the node trips its consensus flag by changing an internal, non-trainable tracking model parameter from `0.0` to `1.0` via a custom model layer (`ConvergenceFlagLayer`).
 
 During Swarm parameter synchronization rounds, the Swarm learning mechanism naturally aggregates these tracking weights via mathematical averaging across all participants:
 
@@ -502,7 +504,7 @@ $$\text{Global Consensus Value} = \frac{1}{N} \sum_{i=1}^{N} \text{Node Flag}_i$
 
 Once all `NUM_NODES` achieve convergence, the unified network model average evaluates to exactly `1.0`. Detecting this network quorum consensus, every node simultaneously re-compiles its operational execution path, unlinking the DP wrapper to continue execution utilizing standard SGD/Adam optimization.
 
-Privacy accounting (`epsilon`) is computed only for the exact epochs in which DP was actively running, reflecting the true privacy cost.
+Privacy accounting (`epsilon`) is computed only for the exact epochs in which DP was actively running. **Known limitation:** Stage 2 (post-drop) currently runs with zero noise, so this ε does not cover the full training run — treat Cascaded DP's reported ε as a Stage-1-only figure until a Stage 2 noise floor is implemented.
 
 ## Notes
 
@@ -511,3 +513,5 @@ Privacy accounting (`epsilon`) is computed only for the exact epochs in which DP
 * TensorFlow Probability: `0.15.0`
 * No shared volume or scratch directory mounting is required for voting; consensus state resolution is calculated natively via the model parameter synchronization framework.
 * Adjust `DIRICHLET_ALPHA` to sweep heterogeneity levels across experiments. Lower values produce more skewed class distributions.
+* `NODE_ID`/`NUM_NODES` correctly determine per-node data-share weighting (`nodeWeightage`) for both IID and Dirichlet partitioning, for any number of nodes — not hardcoded to the 2-node case.
+* Each (α, DP-condition) combination should be run across multiple Dirichlet partition seeds (not just the default fixed seed) before treating results as conclusive — single-seed results cannot distinguish a real heterogeneity effect from an artifact of one particular partition draw, especially at extreme α values.
