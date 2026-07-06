@@ -252,6 +252,33 @@ class CascadedDPCallback(tf.keras.callbacks.Callback):
         # burn-in ends).
         if len(self.grad_norm_window) < self.window_size: return
 
+        # Read the flag BEFORE any local write this epoch. This value
+        # reflects whatever the last actual SwarmCallback sync produced —
+        # i.e. a real cross-host merge — not this epoch's local change.
+        # Checking quorum before writing prevents a node from reading back
+        # its own just-set 1.0 as if it were already-merged consensus,
+        # which would falsely report full quorum the instant a single node
+        # converges, before any other peer has done anything.
+        # NOTE: this is a *weightage-weighted* merge (SwarmCallback was given
+        # nodeWeightage), not a plain unweighted average of {0,1} votes. So
+        # global_flag_value is NOT "fraction of nodes converged" whenever
+        # weightage is non-uniform (e.g. under Dirichlet non-IID splits) —
+        # e.g. 0.7525 could mean one node (carrying ~75% weightage) has
+        # converged and the other (carrying ~25%) has not. Do NOT back out a
+        # literal converged-node count from this value; log it as a raw
+        # weighted fraction instead.
+        global_flag_value = float(self.flag_layer.flag.numpy()[0])
+        print(f"  [CascadedDP-Quorum] Node {self.node_id} tracking global weighted flag value: "
+              f"{global_flag_value:.4f} (this is a weightage-weighted average, not a literal node count; "
+              f"only == 1.0 implies every node has actually converged)")
+
+        # Quorum is reached only when ALL nodes have set their local flag parameter to 1.0 (weighted mean == 1.0,
+        # which can only happen if literally every node's local flag is 1.0, regardless of weightage).
+        # 0.999 rather than an exact 1.0 comparison to allow for floating-point merge/round-trip error.
+        if global_flag_value >= 0.999:
+            self._drop_dp(epoch)
+            return
+
         # Absolute change in the rolling grad-norm mean vs. the previous
         # epoch, compared against the burn-in noise floor rather than a
         # hand-picked constant — this makes the trigger self-scaling with
@@ -262,36 +289,75 @@ class CascadedDPCallback(tf.keras.callbacks.Callback):
         # burn-in accuracy-variance floor for the same reason.
         acc_variance = float(np.var(self.acc_window))
 
-        slope_trigger = grad_slope < self.k_slope * self.burn_in_std_grad
-        plateau_trigger = acc_variance < self.k_acc * self.burn_in_var_acc
+        slope_threshold = self.k_slope * self.burn_in_std_grad
+        acc_threshold = self.k_acc * self.burn_in_var_acc
+        slope_trigger = grad_slope < slope_threshold
+        plateau_trigger = acc_variance < acc_threshold
 
-        # Evaluate local convergence criteria
+        # Per-node diagnostic: shows the actual margin to each trigger, not
+        # just the AND'd boolean. Without this it's impossible to tell
+        # whether a stuck node is close to converging or nowhere near it —
+        # e.g. under a skewed Dirichlet shard, acc_variance may sit
+        # persistently above its threshold because DP noise keeps the local
+        # val_accuracy jittering by roughly the same amount all the way
+        # through training, rather than actually damping down over time.
+        print(
+            f"  [CascadedDP-Trigger] Node={self.node_id} | epoch={epoch + 1} | "
+            f"grad_slope={grad_slope:.6f} (thresh {slope_threshold:.6f}, {'PASS' if slope_trigger else 'fail'}) | "
+            f"acc_variance={acc_variance:.8f} (thresh {acc_threshold:.8f}, {'PASS' if plateau_trigger else 'fail'}) | "
+            f"local_converged={self.local_converged}"
+        )
+
+        # Evaluate local convergence criteria. This write happens AFTER the
+        # quorum check above, so the earliest this node's own vote can be
+        # read back as part of a merged quorum is on a LATER epoch, once an
+        # actual SwarmCallback sync has had a chance to run in between.
+        #
+        # IMPORTANT: every SwarmCallback merge round overwrites this node's
+        # local flag weight with the incoming swarm-averaged value via
+        # set_weights() — including on nodes that already voted 1.0. If we
+        # only write 1.0 once (guarded by local_converged), that write gets
+        # silently diluted back down by the very next merge and is never
+        # re-affirmed, so no node's true vote survives more than one sync
+        # round and the global average can never actually reach 1.0. So we
+        # re-assert 1.0 every epoch once converged, regardless of whatever
+        # the last merge overwrote it to — this guarantees the NEXT outgoing
+        # merge always carries this node's true current vote.
         if slope_trigger and plateau_trigger:
-            if not self.local_converged:
-                self.local_converged = True
-                # Flip this node's weight parameter value to 1.0. This
-                # change only becomes visible to other nodes once
-                # SwarmCallback performs its next weight merge — it is not
-                # instantaneous.
-                self.flag_layer.flag.assign([1.0])
-                print(f"  [CascadedDP-Consensus] Node {self.node_id} local convergence met. Set local flag weight to 1.0.")
+            self.local_converged = True
 
-        # Read the averaged weight parameter state distributed across the Swarm network.
-        # Because the merge averages every peer's flag (0.0 or 1.0), this
-        # value is a direct proxy for "fraction of peers converged so far".
-        global_flag_value = float(self.flag_layer.flag.numpy()[0])
-        converged_peers = int(round(global_flag_value * self.num_nodes))
-        
-        print(f"  [CascadedDP-Quorum] Node {self.node_id} tracking global parameter value: {global_flag_value:.4f} ({converged_peers}/{self.num_nodes} nodes converged).")
-
-        # Quorum is reached only when ALL nodes have set their local flag parameter to 1.0 (mean == 1.0).
-        # 0.999 rather than an exact 1.0 comparison to allow for floating-point merge/round-trip error.
-        if global_flag_value >= 0.999:
-            self._drop_dp(epoch)
+        if self.local_converged:
+            self.flag_layer.flag.assign([1.0])
+            print(f"  [CascadedDP-Consensus] Node {self.node_id} re-asserting local flag = 1.0 "
+                  f"(local_converged={self.local_converged})")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MAIN
+# FLAG-VALUE OBSERVER (pure debugging aid — no vendor code touched)
 # ─────────────────────────────────────────────────────────────────────────────
+
+class FlagObserverCallback(tf.keras.callbacks.Callback):
+    """
+    Registered AFTER SwarmCallback in the callbacks list, so Keras invokes
+    this on_train_batch_end strictly after SwarmCallback's own — meaning any
+    time SwarmCallback just performed a merge and called set_weights(), this
+    will see the new value on the very next batch. Prints only on change, so
+    it won't spam every batch; this pinpoints exactly which batch/epoch a
+    merge actually moved the flag, without editing swarm_tf_source.py.
+    """
+    def __init__(self, flag_layer, node_id):
+        super().__init__()
+        self.flag_layer = flag_layer
+        self.node_id = node_id
+        self._last_seen = None
+
+    def on_train_batch_end(self, batch, logs=None):
+        current = float(self.flag_layer.flag.numpy()[0])
+        if self._last_seen is None or abs(current - self._last_seen) > 1e-9:
+            print(f"  [FlagObserver] Node={self.node_id} | batch={batch} | "
+                  f"flag changed: {self._last_seen} -> {current}")
+            self._last_seen = current
+
+
 
 def main():
     modelName = 'fashion-mnist'
@@ -433,6 +499,7 @@ def main():
     # merges model weights across peers every syncFrequency batches, using
     # nodeWeightage to weight each peer's contribution to the merge.
     callbacks = [SwarmCallback(syncFrequency=1024, useAdaptiveSync=False, minPeers=minPeers, adsValData=val_ds, adsValBatchSize=batchSize, mergeMethod='mean', nodeWeightage=nodeWeightage, totalEpochs=maxEpoch)]
+    callbacks.append(FlagObserverCallback(flag_layer, nodeId))
     
     cdp = None
     if dpEnabled and cascadedDp:
