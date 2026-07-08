@@ -9,13 +9,14 @@ The ML program is in `workspace/fashion-mnist/model` and is called `fashion-mnis
 This example shows the Swarm training of a Fashion-MNIST classifier using two Machine Learning (ML) nodes launched directly via `run-sl`, without SWOP or SWCI. All nodes run on a single host. This example also shows how private data, scratch spaces, and model files can be mounted to Machine Learning nodes for Swarm training.
 
 ## Cluster Setup
- 
+
 The cluster setup for this example uses only one host, as shown in the figure below:
- 
-* host-1: 172.1.1.1
-|<img width="1372" height="771" alt="fashion-MNIST-cluster-setup" src="https://github.com/user-attachments/assets/52e11724-6b98-4ca7-9763-3b12f7edbcb1" />|
+- host-1: 172.1.1.1
+
+|<img width="1372" height="771" alt="Fashion-MNIST-cluster-setup" src="https://github.com/user-attachments/assets/52e11724-6b98-4ca7-9763-3b12f7edbcb1" />|
 |:--:|
 |<b>Figure 1: Cluster setup for the Cascaded DP Fashion MNIST example</b>|
+
 
 * This example uses one Swarm Network (SN) node. The name of the docker container representing this node is `sn1`. `sn1` is also the Sentinel Node. `sn1` runs on host 172.1.1.1.
 * Two Swarm Learning (SL) and two Machine Learning (ML) nodes are launched directly using `run-sl`. The names of the docker containers representing these nodes are `sl1` and `sl2`, with associated ML containers `ml1` and `ml2`. Both run on host 172.1.1.1.
