@@ -23,3 +23,13 @@
 | exp_cascaded_dp_noise1.0_iid | 1.0 | 0.4 | 0.0005 | 0.7859 | 16 | 1537.34 | 90.04% | 0.9005 |
 | exp_full_dp_noise1.5_iid | 1.5 | — | — | 0.6301 | — | 2638.33 | 73.98% | 0.7247 |
 | exp_cascaded_dp_noise1.5_iid | 1.5 | 0.4 | 0.0005 | 0.3072 | 11 | 1394.30 | 89.63% | 0.8963 |
+
+> [!NOTE]
+> For cascaded DP runs, the provided epsilon ($\varepsilon$) value only reflects the privacy budget consumed during the first stage before the DP cutoff. It does not serve as a metric for total privacy preservation.
+
+### Results as a Bar graph
+
+<img width="1600" height="1200" alt="Accuracy_Bar" src="https://github.com/user-attachments/assets/e3058662-2423-4ab9-bc9d-e698a66ea8c3" />
+
+<img width="1600" height="1200" alt="Runtime_Bar" src="https://github.com/user-attachments/assets/fccb0be3-e931-42e3-b589-551e5b1cf272" />
+
