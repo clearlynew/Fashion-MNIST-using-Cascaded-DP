@@ -71,7 +71,7 @@ fashion-mnist/
 
 1. **On host-1:** Change to the swarm-learning folder (the parent of the examples directory).
 ```bash
-cd ~/swarm-learning
+cd swarm-learning
 
 ```
 
@@ -111,19 +111,19 @@ docker network create host-1-net
 
 6. **On host-1:** Create separate temporary mount directories for each SL node and a results directory. Set appropriate permissions.
 ```bash
-mkdir -p ~/swarm-learning/workspace/fashion-mnist/tmp/sl1
-mkdir -p ~/swarm-learning/workspace/fashion-mnist/tmp/sl2
-mkdir -p ~/swarm-learning/workspace/fashion-mnist/results
-chmod -R 777 ~/swarm-learning/workspace/fashion-mnist/tmp
-chmod -R 777 ~/swarm-learning/workspace/fashion-mnist/results
+mkdir -p ./workspace/fashion-mnist/tmp/sl1
+mkdir -p ./workspace/fashion-mnist/tmp/sl2
+mkdir -p ./workspace/fashion-mnist/results
+chmod -R 777 ./workspace/fashion-mnist/tmp
+chmod -R 777 ./workspace/fashion-mnist/results
 
 ```
 
 
 7. **On host-1:** Copy the SwarmLearning wheel file into the ML Docker build context.
 ```bash
-cp ~/swarm-learning/lib/swarmlearning-client-py3-none-manylinux_2_24_x86_64.whl \
-~/swarm-learning/workspace/fashion-mnist/ml-context/swarmlearning-0.0.1-py3-none-manylinux_2_24_x86_64.whl
+cp ./lib/swarmlearning-client-py3-none-manylinux_2_24_x86_64.whl \
+./workspace/fashion-mnist/ml-context/swarmlearning-0.0.1-py3-none-manylinux_2_24_x86_64.whl
 
 ```
 
@@ -131,7 +131,7 @@ cp ~/swarm-learning/lib/swarmlearning-client-py3-none-manylinux_2_24_x86_64.whl 
 8. **On host-1:** Build the ML Docker image that will be used to run the Fashion-MNIST model inside the ML containers.
 ```bash
 docker build -t fashion-ml-env \
-~/swarm-learning/workspace/fashion-mnist/ml-context
+./workspace/fashion-mnist/ml-context
 
 ```
 
@@ -161,7 +161,7 @@ export SN_API_PORT=30304
 
 11. **On host-1:** Run the Swarm Network node (`sn1`), which serves as the Sentinel node.
 ```bash
-cd ~/swarm-learning
+
 ./scripts/bin/run-sn -d --name=sn1 \
 --network=host-1-net \
 --host-ip=${HOST_IP} \
@@ -228,7 +228,7 @@ swarm.blCnt : INFO : Starting SWARM-API-SERVER on port: 30304
 --apls-ip=${APLS_IP}
 
 docker logs -f ml1 > \
-~/swarm-learning/workspace/fashion-mnist/results/exp_baseline_ml1.log 2>&1 &
+./workspace/fashion-mnist/results/exp_baseline_ml1.log 2>&1 &
 
 ```
 
@@ -263,7 +263,7 @@ docker logs -f ml1 > \
 --apls-ip=${APLS_IP}
 
 docker logs -f ml2 > \
-~/swarm-learning/workspace/fashion-mnist/results/exp_baseline_ml2.log 2>&1 &
+./workspace/fashion-mnist/results/exp_baseline_ml2.log 2>&1 &
 
 ```
 
@@ -305,7 +305,7 @@ docker logs -f ml2 > \
 --apls-ip=${APLS_IP}
 
 docker logs -f ml1 > \
-~/swarm-learning/workspace/fashion-mnist/results/exp_full_dp_ml1.log 2>&1 &
+./workspace/fashion-mnist/results/exp_full_dp_ml1.log 2>&1 &
 
 ```
 
@@ -344,7 +344,7 @@ docker logs -f ml1 > \
 --apls-ip=${APLS_IP}
 
 docker logs -f ml2 > \
-~/swarm-learning/workspace/fashion-mnist/results/exp_full_dp_ml2.log 2>&1 &
+./workspace/fashion-mnist/results/exp_full_dp_ml2.log 2>&1 &
 
 ```
 
@@ -390,7 +390,7 @@ docker logs -f ml2 > \
 --apls-ip=${APLS_IP}
 
 docker logs -f ml1 > \
-~/swarm-learning/workspace/fashion-mnist/results/exp_cascaded_dp_ml1.log 2>&1 &
+./workspace/fashion-mnist/results/exp_cascaded_dp_ml1.log 2>&1 &
 
 ```
 
@@ -433,7 +433,7 @@ docker logs -f ml1 > \
 --apls-ip=${APLS_IP}
 
 docker logs -f ml2 > \
-~/swarm-learning/workspace/fashion-mnist/results/exp_cascaded_dp_ml2.log 2>&1 &
+./workspace/fashion-mnist/results/exp_cascaded_dp_ml2.log 2>&1 &
 
 ```
 
