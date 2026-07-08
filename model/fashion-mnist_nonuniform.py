@@ -47,11 +47,6 @@ class ConvergenceFlagLayer(tf.keras.layers.Layer):
     Sequential model preserves all predictions and metrics while establishing 
     a cross-host communication channel via standard weight-merging mechanisms.
 
-    NOTE: This consensus mechanism relies on SwarmCallback's mergeMethod='mean'
-    correctly averaging non-trainable weights along with trainable ones. If 
-    SwarmCallback is modified to only merge trainable variables, this flag 
-    will remain isolated at each node's local value, and global quorum will 
-    never be detected.
     """
     def __init__(self):
         super().__init__(name="convergence_flag_layer")
@@ -85,8 +80,8 @@ class CascadedDPCallback(tf.keras.callbacks.Callback):
     recompiling the model with a standard, non-private optimizer.
     """
     def __init__(self, val_ds, node_id, num_nodes, flag_layer, optimizer_type='sgd', 
-                 learning_rate=0.01, window_size=5, k_slope=1.0, 
-                 k_acc=1.0, min_dp_epochs=5):
+                 learning_rate=0.01, window_size=5, grad_threshold=0.01, 
+                 acc_threshold=0.0005, min_dp_epochs=5):
         super().__init__()
         self.val_ds = val_ds                              # Held-out dataset used for gradient-norm evaluation and convergence verification
         self.node_id = node_id                             # Current node index, utilized for logging purposes
@@ -95,9 +90,9 @@ class CascadedDPCallback(tf.keras.callbacks.Callback):
         self.optimizer_type = optimizer_type               # Target optimizer architecture ('sgd' or 'adam') to use post-DP
         self.learning_rate = learning_rate                 # Learning rate applied to the standard optimizer after DP is disabled
         self.window_size = window_size                     # Rolling window size (epochs) for tracking gradient-norm means and accuracy variance
-        self.k_slope = k_slope                             # Multiplier applied to the burn-in gradient-norm noise floor threshold
-        self.k_acc = k_acc                                 # Multiplier applied to the burn-in validation accuracy variance floor threshold
-        self.min_dp_epochs = min_dp_epochs                 # Enforced minimum DP training epochs; establishes the baseline burn-in window
+        self.grad_threshold = grad_threshold               # Fixed absolute threshold on epoch-to-epoch rolling grad-norm slope
+        self.acc_threshold = acc_threshold                 # Fixed absolute threshold on windowed validation-accuracy variance
+        self.min_dp_epochs = min_dp_epochs                 # Enforced minimum DP training epochs before convergence checks begin
 
         self.grad_norm_window = deque(maxlen=window_size)   # Rolling buffer for per-epoch gradient norms
         self.acc_window = deque(maxlen=window_size)          # Rolling buffer for per-epoch validation accuracy
@@ -108,15 +103,6 @@ class CascadedDPCallback(tf.keras.callbacks.Callback):
         self.dp_drop_epoch = None                             # Tracked epoch (1-indexed) where DP was disabled (used for epsilon accounting)
         self.dp_drop_reason = None                            # Metadata snapshot capturing the specific metrics that triggered the DP transition
         self.local_converged = False                          # State guard preventing redundant updates to the local flag weight
-
-        # Burn-in noise floor: Dynamically scales trigger thresholds by estimating the 
-        # baseline noise inherent to gradient norms and validation accuracy during the initial 
-        # min_dp_epochs. This self-scaling behavior adapts to architecture-specific noise 
-        # levels without requiring manual re-tuning of hardcoded thresholds.
-        self.burn_in_grad_norms = []                          # Gradient norms gathered strictly during the burn-in phase
-        self.burn_in_accs = []                                # Validation accuracies gathered strictly during the burn-in phase
-        self.burn_in_std_grad = None                           # Standard deviation of gradient norms calculated post-burn-in
-        self.burn_in_var_acc = None                             # Variance of validation accuracy calculated post-burn-in
 
         # Dedicated loss function instance for tracking gradient magnitudes without impacting training loss
         self._measure_loss = tf.keras.losses.CategoricalCrossentropy(from_logits=False)
@@ -176,10 +162,8 @@ class CascadedDPCallback(tf.keras.callbacks.Callback):
         # Capture precise snapshot metrics for output logging and diagnostic validation
         self.dp_drop_reason = {
             "epoch": epoch + 1,
-            "k_slope": self.k_slope,
-            "k_acc": self.k_acc,
-            "burn_in_std_grad": self.burn_in_std_grad,
-            "burn_in_var_acc": self.burn_in_var_acc,
+            "grad_threshold": self.grad_threshold,
+            "acc_threshold": self.acc_threshold,
             "rolling_mean": float(np.mean(self.grad_norm_window)),
             "val_acc_window": list(self.acc_window)
         }
@@ -209,20 +193,9 @@ class CascadedDPCallback(tf.keras.callbacks.Callback):
             f"grad_norm={grad_norm:.6f} | rolling_mean={rolling_mean:.6f} | val_acc={val_acc:.4f}"
         )
 
-        # Burn-in Phase: Accumulate initial metric logs to calculate dynamic performance noise baselines
+        # Burn-in Phase: Skip convergence checks until the minimum DP epoch count has elapsed
         if epoch + 1 <= self.min_dp_epochs:
-            self.burn_in_grad_norms.append(grad_norm)
-            self.burn_in_accs.append(val_acc)
             return
-
-        # Compute dynamic noise boundaries exactly once upon concluding the initial burn-in window
-        if self.burn_in_std_grad is None:
-            self.burn_in_std_grad = max(float(np.std(self.burn_in_grad_norms)), 1e-8)
-            self.burn_in_var_acc = max(float(np.var(self.burn_in_accs)), 1e-10)
-            print(
-                f"  [CascadedDP] Node={self.node_id} | burn-in noise floor set: "
-                f"grad_std={self.burn_in_std_grad:.6f} | acc_var={self.burn_in_var_acc:.8f}"
-            )
 
         # Enforce evaluation constraints until rolling windows match configured sizing definitions
         if len(self.grad_norm_window) < self.window_size: return
@@ -245,16 +218,14 @@ class CascadedDPCallback(tf.keras.callbacks.Callback):
         grad_slope = abs(self.rolling_history[-2] - self.rolling_history[-1]) if len(self.rolling_history) >= 2 else float('inf')
         acc_variance = float(np.var(self.acc_window))
 
-        slope_threshold = self.k_slope * self.burn_in_std_grad
-        acc_threshold = self.k_acc * self.burn_in_var_acc
-        slope_trigger = grad_slope < slope_threshold
-        plateau_trigger = acc_variance < acc_threshold
+        slope_trigger = grad_slope < self.grad_threshold
+        plateau_trigger = acc_variance < self.acc_threshold
 
         # Log active telemetry indicators mapping current convergence states
         print(
             f"  [CascadedDP-Trigger] Node={self.node_id} | epoch={epoch + 1} | "
-            f"grad_slope={grad_slope:.6f} (thresh {slope_threshold:.6f}, {'PASS' if slope_trigger else 'fail'}) | "
-            f"acc_variance={acc_variance:.8f} (thresh {acc_threshold:.8f}, {'PASS' if plateau_trigger else 'fail'}) | "
+            f"grad_slope={grad_slope:.6f} (thresh {self.grad_threshold:.6f}, {'PASS' if slope_trigger else 'fail'}) | "
+            f"acc_variance={acc_variance:.8f} (thresh {self.acc_threshold:.8f}, {'PASS' if plateau_trigger else 'fail'}) | "
             f"local_converged={self.local_converged}"
         )
 
@@ -267,6 +238,19 @@ class CascadedDPCallback(tf.keras.callbacks.Callback):
         if self.local_converged:
             self.flag_layer.flag.assign([1.0])
             print(f"  [CascadedDP-Consensus] Node {self.node_id} re-asserting local flag = 1.0 "
+                  f"(local_converged={self.local_converged})")
+        else:
+            # Without this, a merge round overwrites this node's flag with the
+            # partially-merged value (e.g. 0.5), and since local_converged is
+            # still False nothing corrects it back down. The next merge then
+            # averages that stale, already-inflated value against a converged
+            # peer's 1.0, producing a creeping 0.5 -> 0.75 -> 0.875 -> ...
+            # sequence that eventually crosses quorum on its own, even though
+            # this node never actually satisfied the convergence triggers.
+            # Re-asserting 0.0 every epoch keeps this node's true (unconverged)
+            # vote intact through every merge round.
+            self.flag_layer.flag.assign([0.0])
+            print(f"  [CascadedDP-Consensus] Node {self.node_id} re-asserting local flag = 0.0 "
                   f"(local_converged={self.local_converged})")
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -306,8 +290,8 @@ def main():
     cascadedDp = os.getenv('CASCADED_DP', 'false').lower() == 'true'        # Toggle for the adaptive convergence-driven DP drop system
     dpDropWindow = int(os.getenv('DP_DROP_WINDOW', '5'))                    # Target tracking epoch window for convergence logic
     minDpEpochs = int(os.getenv('MIN_DP_EPOCHS', '5'))                      # Absolute minimum duration window required for initial DP steps
-    kSlope = float(os.getenv('K_SLOPE', '1.0'))                              # Slope verification parameter coefficient multiplier
-    kAcc = float(os.getenv('K_ACC', '1.0'))                                  # Evaluation threshold variance tracking scaling multiplier
+    gradThreshold = float(os.getenv('GRAD_THRESHOLD', '0.01'))               # Fixed absolute grad-norm slope threshold for convergence
+    accThreshold = float(os.getenv('ACC_THRESHOLD', '0.0005'))               # Fixed absolute val-accuracy variance threshold for convergence
     nodeId = int(os.getenv('NODE_ID', '0'))                                 # Designated identification position index for this worker node
     numNodes = int(os.getenv('NUM_NODES', '2'))                             # Quantified total membership capacity of participating network nodes
 
@@ -327,6 +311,10 @@ def main():
         perm = rng.permutation(len(x_train))
         x_train, y_train = x_train[perm], y_train[perm]
         split_size = len(x_train) // numNodes
+
+        # Sample count for every node (last node gets the remainder), used
+        # below to size syncFrequency off the smallest shard.
+        all_node_sample_counts = [split_size if n != numNodes - 1 else (len(x_train) - split_size * (numNodes - 1)) for n in range(numNodes)]
         
         # Allocate any division remainders to the final node to prevent data loss
         start, end = nodeId * split_size, (len(x_train) if nodeId == numNodes - 1 else (nodeId + 1) * split_size)
@@ -357,6 +345,10 @@ def main():
             bounds = np.concatenate([[0], np.cumsum(splits)])
             for n in range(numNodes): node_idx[n].extend(idx[bounds[n]:bounds[n+1]])
         
+        # Sample count for every node, used below to size syncFrequency off
+        # the smallest shard (the most heterogeneous node's data volume).
+        all_node_sample_counts = [len(node_idx[n]) for n in range(numNodes)]
+
         # Compute exact regional scaling attributes matching local slice distribution
         total = sum(len(node_idx[n]) for n in range(numNodes))
         nodeWeightage = int(round(100 * len(node_idx[nodeId]) / total))
@@ -375,6 +367,14 @@ def main():
     num_train_samples = len(x_train)
     y_train_cat = tf.keras.utils.to_categorical(y_train, 10)  # Generate standard one-hot target matrices
     y_test_cat = tf.keras.utils.to_categorical(y_test, 10)
+
+    # syncFrequency is set to the smallest node's batches-per-epoch (min
+    # sample count across all nodes // batchSize, matching drop_remainder),
+    # so every node syncs at least once per epoch even at its most
+    # heterogeneous/smallest shard, with a floor of 1 to stay valid.
+    min_node_samples = min(all_node_sample_counts)
+    syncFrequency = max(1, min_node_samples // batchSize)
+    print(f"***** Dynamic syncFrequency = {syncFrequency} (derived from smallest node shard = {min_node_samples} samples)")
 
     # Initialize the tracking layer instance before compilation to ensure shared reference integrity
     flag_layer = ConvergenceFlagLayer()
@@ -411,13 +411,13 @@ def main():
     val_ds = tf.data.Dataset.from_tensor_slices((x_test, y_test_cat)).batch(batchSize).prefetch(tf.data.AUTOTUNE)
 
     # Initialize primary Swarm parameters controlling sync updates across structural loops
-    callbacks = [SwarmCallback(syncFrequency=1024, useAdaptiveSync=False, minPeers=minPeers, adsValData=val_ds, adsValBatchSize=batchSize, mergeMethod='mean', nodeWeightage=nodeWeightage, totalEpochs=maxEpoch)]
+    callbacks = [SwarmCallback(syncFrequency=syncFrequency, useAdaptiveSync=False, minPeers=minPeers, adsValData=val_ds, adsValBatchSize=batchSize, mergeMethod='mean', nodeWeightage=nodeWeightage, totalEpochs=maxEpoch)]
     callbacks.append(FlagObserverCallback(flag_layer, nodeId))
     
     cdp = None
     if dpEnabled and cascadedDp:
         # Initialize adaptive cascading optimization triggers if conditions are met
-        cdp = CascadedDPCallback(val_ds, nodeId, numNodes, flag_layer, optimizerType, actual_lr, dpDropWindow, kSlope, kAcc, minDpEpochs)
+        cdp = CascadedDPCallback(val_ds, nodeId, numNodes, flag_layer, optimizerType, actual_lr, dpDropWindow, gradThreshold, accThreshold, minDpEpochs)
         callbacks.append(cdp)
 
     print('Starting training ...')
@@ -444,7 +444,7 @@ def main():
     results = {
         "config": {"model_name": modelName, "node_id": nodeId, "num_nodes": numNodes, "epochs": maxEpoch, "batch_size": batchSize, "optimizer": optimizerType, "learning_rate": actual_lr, "dp_enabled": dpEnabled, "cascaded_dp": cascadedDp, "l2_norm_clip": l2NormClip, "noise_multiplier": noiseMultiplier, "microbatches": microbatches, "partition_mode": partitionMode, "num_train_samples": num_train_samples},
         "performance": {"training_time_seconds": training_time, "final_test_loss": float(eval_res[0]), "final_test_accuracy": float(eval_res[1]), "final_test_f1_macro": float(f1_score(y_true, y_pred, average='macro'))},
-        "privacy": {"epsilon": round(eps, 4) if eps is not None else None, "delta": 1.0/num_train_samples if dpEnabled else None, "dp_drop_epoch": cdp.dp_drop_epoch if cdp else None, "k_slope": kSlope, "k_acc": kAcc, "burn_in_std_grad": cdp.burn_in_std_grad if cdp else None, "burn_in_var_acc": cdp.burn_in_var_acc if cdp else None, "dp_drop_reason": cdp.dp_drop_reason if cdp else None}
+        "privacy": {"epsilon": round(eps, 4) if eps is not None else None, "delta": 1.0/num_train_samples if dpEnabled else None, "dp_drop_epoch": cdp.dp_drop_epoch if cdp else None, "grad_threshold": gradThreshold, "acc_threshold": accThreshold, "dp_drop_reason": cdp.dp_drop_reason if cdp else None}
     }
     
     with open(f"/results/{os.getenv('RESULT_FILE', 'results.json')}", 'w') as f: json.dump(results, f, indent=2)
