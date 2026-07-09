@@ -479,3 +479,10 @@ Privacy accounting (epsilon) is computed only for the exact epochs in which DP w
 * **TensorFlow Privacy:** 0.7.3
 * **TensorFlow Probability:** 0.15.0
 * Adjust `DIRICHLET_ALPHA` to sweep heterogeneity levels across experiments. Lower values produce more skewed class distributions.
+
+
+## References
+[1] H. Xiao, K. Rasul and R. Vollgraf, "Fashion-MNIST: a Novel Image Dataset for Benchmarking Machine Learning Algorithms," arXiv:1708.07747, 2017. [Online]. Available:
+https://arxiv.org/abs/1708.07747
+
+[2] https://www.tensorflow.org/tutorials/quickstart/beginner
