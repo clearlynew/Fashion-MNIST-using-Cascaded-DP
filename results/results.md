@@ -26,10 +26,3 @@
 
 > [!NOTE]
 > For cascaded DP runs, the provided epsilon ($\varepsilon$) value only reflects the privacy budget consumed during the first stage before the DP cutoff. It does not serve as a metric for total privacy preservation.
-
-### Results as a Bar graph
-
-<img width="1600" height="1200" alt="Accuracy_Bar" src="https://github.com/user-attachments/assets/e3058662-2423-4ab9-bc9d-e698a66ea8c3" />
-
-<img width="1600" height="1200" alt="Runtime_Bar" src="https://github.com/user-attachments/assets/fccb0be3-e931-42e3-b589-551e5b1cf272" />
-
